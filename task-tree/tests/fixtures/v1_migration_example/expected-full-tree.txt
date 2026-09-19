@@ -1,0 +1,9 @@
+[ ] #2 Secondary root
+[~] #1 Primary migration root
+  [x] #3 Completed setup
+  [ ] #5 Later pending child
+  [~] #4 Active middle child << ACTIVE
+    [ ] #6 Nested pending child
+  [x] #7 Completed branch
+    [x] #8 Completed grandchild
+  [!] #9 Impossible sibling
