@@ -3,7 +3,7 @@
 A durable adaptive task-tree for keeping Codex work structured across long, multi-session projects. 
 Switch workstreams, reorder priorities, and resume with durable context.
 
-Self-contained skill - just copy `task_tree` into your skills folder.
+Self-contained skill - just copy `task-tree` into your skills folder.
 
 ## Why?
 
@@ -43,4 +43,19 @@ $ python .agents/skills/task-tree/scripts/task_tree.py show
 As you work through your task-tree, you can adjust it:
 - Add child tasks to an existing task.
 - Reorder tasks.
-- Delete a sub-tree.
+- Create a priority task that returns to current task on completion (instead of its parent).
+
+## Usage
+
+After installing as a skill for your AI agent, manage task-tree via normal prompts:
+
+- `Create a task to investigate bug X.`
+
+- `Switch to the task about investigating bug X`
+
+- `Add a priority task to do <urgent thing>, that returns to current task`
+
+- `Prepare an implementation plan for this task, spread over child tasks`
+
+The agent uses the task-tree skill to create and maintain the persistent task tree.
+Loading `task-tree` skill automatically loads the active task.
