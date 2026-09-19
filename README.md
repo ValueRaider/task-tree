@@ -13,7 +13,7 @@ This is for projects that start with a plan, but that plan evolves massively as 
 - Insert some prerequisite work.
 - Reorder parts of project plan.
 
-You want to do this without your current work being damaged by context compaction.
+**You want to do this without your current work being damaged by context compaction.**
 
 ## What is a task
 
