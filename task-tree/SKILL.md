@@ -130,6 +130,40 @@ relative next-task traversal, and the exact procedure for
 inserting a new child before an active middle child, see
 [references/execution-order.md](references/execution-order.md).
 
+## Placing New Tasks
+
+When deciding where to place new work, first inspect the compact snapshot. The
+active task's details plus its parent and nearby sibling titles normally provide
+enough context.
+
+- If the work directly advances the active task's outcome, create it as a child
+  of the active task.
+- If it is a distinct track toward the active task's parent-level outcome,
+  create it as a sibling under that parent.
+- If a visible sibling or parent clearly owns the new work, place it in that
+  subtree.
+- Otherwise, create a new root task.
+
+Use `show <id> --details` only when a task body or closeout criteria are needed
+to resolve placement. Ask the user only when that focused inspection still
+leaves ownership unclear; do not expand the full tree by default. Titles are an
+initial routing signal, not proof of ownership.
+
+## Temporary Work Interruptions
+
+When the user asks to temporarily switch to work outside the current subtree,
+or otherwise clearly indicates an interruption, create the new task with
+`return_to_id` set to the current active task and make the new task active.
+This lets the tree return focus after the interruption's subtree becomes
+terminal. Parentage and `return_to_id` are independent: an urgent task may
+belong under another workstream while still returning focus to the interrupted
+task.
+
+Use `--return-to <current-id>` with `--set-active` when creating the task. If
+the user clearly requests a permanent reprioritization, do not set a return
+pointer. If the request does not establish whether the change is temporary, ask
+whether they want to resume the current task afterward.
+
 For a temporary priority interruption, `return_to_id` can override ordinary
 post-completion traversal without changing hierarchy or sibling order. The
 return fires once, when the focused task crosses into a terminal state and its
