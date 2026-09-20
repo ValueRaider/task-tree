@@ -1,0 +1,7 @@
+.agents
+.agent-skills
+.codex
+.codex-workdir
+.pytest_cache
+__pycache__
+task_tree
