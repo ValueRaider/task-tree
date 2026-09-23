@@ -59,3 +59,18 @@ After installing as a skill for your AI agent, manage task-tree via normal promp
 
 The agent uses the task-tree skill to create and maintain the persistent task tree.
 Loading `task-tree` skill automatically loads the active task.
+
+## Interactive terminal viewer
+
+```bash
+python .agents/skills/task-tree/scripts/task_tree.py tui
+```
+
+Navigate with the mouse or arrow keys. 
+
+Move a task by (i) selecting it and pressing `m` or (ii) click-and-drag it. 
+Then go to target location: click/drop left-half ot task text to insert after it, 
+or right-half to add as a child. Press `u` to undo move.
+
+See the [command reference](task-tree/references/commands.md) for
+the full controls.

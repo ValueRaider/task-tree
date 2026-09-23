@@ -115,6 +115,35 @@ class TaskTreeStore:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+@dataclass(frozen=True)
+class RelocationReceipt:
+    """Describe one completed in-memory relocation.
+
+    The receipt records the direct-owner context on both sides of the
+    mutation. It is immutable so callers can retain it for a later undo
+    operation without changing the facts observed under the store lock.
+    """
+
+    source_id: int
+    original_parent_id: Optional[int]
+    original_index: int
+    original_previous_id: Optional[int]
+    original_next_id: Optional[int]
+    destination_parent_id: Optional[int]
+    final_index: int
+    final_previous_id: Optional[int]
+    final_next_id: Optional[int]
+    moved_at: str
+
+    @property
+    def source_task_id(self) -> int:
+        return self.source_id
+
+    @property
+    def final_parent_id(self) -> Optional[int]:
+        return self.destination_parent_id
+
+
 def store_path_selection(cli_tree_file: Optional[str] = None) -> tuple[str, Optional[str]]:
     """Return the selected path and the deprecated environment variable, if used."""
     if cli_tree_file:
@@ -278,6 +307,111 @@ def owning_id_list(data: Dict, node_id: int) -> List[int]:
 
 def destination_id_list(data: Dict, parent_id: Optional[int]) -> List[int]:
     return data["root_ids"] if parent_id is None else require_node(data, parent_id)["children"]
+
+
+def relocate_node(
+    data: Dict,
+    source_id: int,
+    destination_parent_id: Optional[int],
+    *,
+    before_id: Optional[int] = None,
+    after_id: Optional[int] = None,
+) -> RelocationReceipt:
+    """Relocate one task subtree while the caller holds the write lock.
+
+    ``before_id`` and ``after_id`` are direct-child anchors of the destination
+    parent. With no anchor the task is appended. The source is removed before
+    resolving the insertion index, which makes anchored same-parent moves
+    correct without special-case index arithmetic.
+    """
+
+    if before_id is not None and after_id is not None:
+        raise ValueError("before_id and after_id are mutually exclusive")
+
+    source = require_node(data, source_id)
+    if destination_parent_id is not None:
+        require_node(data, destination_parent_id)
+        if destination_parent_id in subtree_ids(data, source_id):
+            raise ValueError(f"Cannot move node {source_id} under its own subtree")
+
+    original_owner = owning_id_list(data, source_id)
+    original_index = original_owner.index(source_id)
+    original_previous_id = (
+        original_owner[original_index - 1] if original_index > 0 else None
+    )
+    original_next_id = (
+        original_owner[original_index + 1]
+        if original_index + 1 < len(original_owner)
+        else None
+    )
+    original_parent_id = parent_id_for(data, source_id)
+
+    destination_owner = destination_id_list(data, destination_parent_id)
+    for anchor_id in (before_id, after_id):
+        if anchor_id is None:
+            continue
+        require_node(data, anchor_id)
+        if anchor_id == source_id:
+            raise ValueError(f"Cannot use source node {source_id} as relocation anchor")
+        if anchor_id not in destination_owner:
+            raise ValueError(
+                f"Node {anchor_id} is not a sibling of node {source_id}"
+            )
+
+    # Remove first. For a same-parent relocation this also ensures an anchor's
+    # post-removal index is used rather than its stale pre-removal index.
+    original_owner.remove(source_id)
+    if before_id is not None:
+        final_index = destination_owner.index(before_id)
+    elif after_id is not None:
+        final_index = destination_owner.index(after_id) + 1
+    else:
+        final_index = len(destination_owner)
+    destination_owner.insert(final_index, source_id)
+
+    moved_at = utc_now()
+    # ``utc_now`` intentionally has second precision for compact event logs.
+    # A rapid inverse relocation must nevertheless have a distinct marker so
+    # a retained undo receipt can detect that the task changed again.
+    previous_moved_at = source.get("events", {}).get("moved_at")
+    if previous_moved_at == moved_at:
+        try:
+            moved_at = (
+                datetime.fromisoformat(moved_at.replace("Z", "+00:00"))
+                + timedelta(seconds=1)
+            ).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            # The schema accepts arbitrary event strings; if an old malformed
+            # value happens to equal the current timestamp, retaining the
+            # current valid timestamp is preferable to failing relocation.
+            pass
+    stamp_event(source, "moved_at", moved_at)
+    for parent_id in {original_parent_id, destination_parent_id}:
+        if parent_id is None:
+            continue
+        parent = require_node(data, parent_id)
+        if parent.get("closeout_reviewed", False):
+            parent["closeout_reviewed"] = False
+            stamp_event(parent, "closeout_reviewed_updated_at", moved_at)
+
+    final_previous_id = destination_owner[final_index - 1] if final_index > 0 else None
+    final_next_id = (
+        destination_owner[final_index + 1]
+        if final_index + 1 < len(destination_owner)
+        else None
+    )
+    return RelocationReceipt(
+        source_id=source_id,
+        original_parent_id=original_parent_id,
+        original_index=original_index,
+        original_previous_id=original_previous_id,
+        original_next_id=original_next_id,
+        destination_parent_id=destination_parent_id,
+        final_index=final_index,
+        final_previous_id=final_previous_id,
+        final_next_id=final_next_id,
+        moved_at=moved_at,
+    )
 
 
 def closeout_review_due(data: Dict, node: Dict) -> bool:
@@ -946,6 +1080,25 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_tui(args: argparse.Namespace) -> int:
+    """Run the optional Textual task-tree viewer and relocation UI."""
+
+    try:
+        from task_tree_tui import run_tui
+    except ModuleNotFoundError as exc:
+        if exc.name == "textual":
+            print(
+                "error: the tui command requires Textual. Install it with "
+                "`python -m pip install textual`.",
+                file=sys.stderr,
+            )
+            return 2
+        raise
+    # Pass the already-loaded data-layer callable into the optional UI.  The
+    # TUI must not import this module again under a second identity.
+    return run_tui(default_store(args.tree_file), relocate_node=relocate_node)
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     if args.details and args.node_id is None:
         raise ValueError("show --details requires ID")
@@ -1123,21 +1276,7 @@ def cmd_path(args: argparse.Namespace) -> int:
 def cmd_move(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
     with store.locked_data(write=True) as data:
-        node = require_node(data, args.node_id)
-        old_parent_id = parent_id_for(data, node["id"])
-        if args.parent is not None:
-            require_node(data, args.parent)
-            if args.parent in subtree_ids(data, args.node_id):
-                raise ValueError(f"Cannot move node {args.node_id} under its own subtree")
-        owning_id_list(data, node["id"]).remove(node["id"])
-        destination_id_list(data, args.parent).append(node["id"])
-        stamp_event(node, "moved_at")
-        for parent_id in {old_parent_id, args.parent}:
-            if parent_id is not None:
-                parent = require_node(data, parent_id)
-                if parent.get("closeout_reviewed", False):
-                    parent["closeout_reviewed"] = False
-                    stamp_event(parent, "closeout_reviewed_updated_at")
+        relocate_node(data, args.node_id, args.parent)
         print(render_mutation_result(store, data, full_tree=args.full_tree))
         return 0
 
@@ -1146,38 +1285,33 @@ def cmd_reorder(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
     with store.locked_data(write=True) as data:
         node = require_node(data, args.node_id)
-        owner = owning_id_list(data, node["id"])
         node_parent_id = parent_id_for(data, node["id"])
-        siblings = sibling_nodes(data, node["id"])
-        siblings = [sibling for sibling in siblings if sibling["id"] != node["id"]]
+        siblings = [sibling_id for sibling_id in owning_id_list(data, node["id"]) if sibling_id != node["id"]]
+        before_id = None
+        after_id = None
         if args.first:
-            siblings.insert(0, node)
+            before_id = siblings[0] if siblings else None
         elif args.before is not None:
-            target = require_node(data, args.before)
-            if parent_id_for(data, target["id"]) != node_parent_id:
-                raise ValueError(f"Node {args.before} is not a sibling of node {args.node_id}")
-            insert_at = next(index for index, sibling in enumerate(siblings) if sibling["id"] == args.before)
-            siblings.insert(insert_at, node)
+            before_id = args.before
         elif args.after is not None:
-            target = require_node(data, args.after)
-            if parent_id_for(data, target["id"]) != node_parent_id:
-                raise ValueError(f"Node {args.after} is not a sibling of node {args.node_id}")
-            insert_at = next(index for index, sibling in enumerate(siblings) if sibling["id"] == args.after) + 1
-            siblings.insert(insert_at, node)
+            after_id = args.after
         elif args.before_first_pending:
-            insert_at = next(
+            before_id = next(
                 (
-                    index
-                    for index, sibling in enumerate(siblings)
-                    if sibling["status"] in ("in_progress", "not_started")
+                    sibling_id
+                    for sibling_id in siblings
+                    if require_node(data, sibling_id)["status"] in ("in_progress", "not_started")
                 ),
-                len(siblings),
+                None,
             )
-            siblings.insert(insert_at, node)
-        else:
-            siblings.append(node)
-        owner[:] = [sibling["id"] for sibling in siblings]
-        stamp_event(node, "moved_at")
+        # --last and the no-pending --before-first-pending case both append.
+        relocate_node(
+            data,
+            args.node_id,
+            node_parent_id,
+            before_id=before_id,
+            after_id=after_id,
+        )
         print(render_mutation_result(store, data, full_tree=args.full_tree))
         return 0
 
@@ -1585,6 +1719,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snapshot.add_argument("--json", action="store_true", help="Emit the complete snapshot context as JSON rather than text.")
     snapshot.set_defaults(func=cmd_snapshot)
+
+    tui = add_command(
+        "tui",
+        "tui",
+        help="Browse the task tree interactively",
+        description=(
+            "Open the interactive terminal viewer. Navigate with the mouse or "
+            "arrow keys. Move a task by (i) selecting it and pressing `m` or "
+            "(ii) click-and-drag it. Then go to target location: "
+            "click/drop left-half ot task text to insert after it, or "
+            "or right-half to add as a child. Press `u` to undo move."
+        ),
+    )
+    tui.set_defaults(func=cmd_tui)
 
     show = add_command("show", "show [id]", help="Show the whole tree or a subtree")
     show.add_argument("node_id", nargs="?", type=int, metavar="ID", help="Show this task and its subtree; omit to show all roots.")

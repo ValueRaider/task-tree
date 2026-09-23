@@ -31,6 +31,48 @@ python .agents/skills/task-tree/scripts/task_tree.py path 2
 python .agents/skills/task-tree/scripts/task_tree.py shared-dir
 ```
 
+### Interactive terminal viewer (optional)
+
+```bash
+python -m pip install textual
+python .agents/skills/task-tree/scripts/task_tree.py tui
+```
+
+To browse a non-default tree, place the global `--tree-file` option before the
+command:
+
+```bash
+python .agents/skills/task-tree/scripts/task_tree.py \
+  --tree-file path/to/tree.json tui
+```
+
+`tui` is an interactive Textual browser. Use Up/Down or the mouse to select a
+task. Right expands it; Left collapses it, or moves to its parent when it is
+already collapsed or has no children. Space or its expander toggles its
+sub-tree. Press `r` to reload and `q` to quit. The right-hand details pane
+scrolls with the mouse wheel; press
+`Tab` to focus it, then use Up/Down, PageUp/PageDown, Home, or End. Selecting
+another task resets the details to the top. On opening it reveals the branch
+to the active task and expands that task when it has children. To relocate a
+task, press it and move the pointer. The valid durable task under the
+pointer is the candidate task. Within the
+candidate task's actual text, the left half places the source immediately
+after it, shown by underlining its label; the right half appends the source as
+a child, shown by visibly highlighting the candidate label as the new parent.
+This choice uses the candidate text midpoint and is independent of where the
+source was clicked or selected. Leaf tasks reserve the same two-cell expander
+width as expandable siblings so task text aligns; nested leaves use a short
+horizontal extension in that slot. The marker preview only restyles rows and
+does not alter layout or expansion.
+
+To avoid holding the mouse button, select a task and press `m`. Move the pointer
+over a candidate task's text and the same midpoint rule applies, independent of
+how the source was selected. Release a held drag or click in move mode to
+place it; press `Escape`, press `m` again, or release outside to cancel. `U` or
+`Ctrl+Z` undoes the most recent TUI
+relocation for the current session when still safe, while reload clears the
+undo. Mutations use the normal locked store, not direct JSON edits.
+
 Details list at most ten artifact paths relative to the task files directory
 and report omitted paths. They show only first-level children (first three,
 then an omitted count), never grandchildren. A non-root parent is rendered in
