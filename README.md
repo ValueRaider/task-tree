@@ -1,7 +1,7 @@
 # task-tree
 
 A durable adaptive task-tree for keeping Codex work structured across long, multi-session projects. 
-Switch workstreams, reorder priorities, and resume with durable context.
+Switch workstreams, reorder priorities, and resume (in a new session) with durable context.
 
 Self-contained skill - just copy `task-tree` into your skills folder.
 
