@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import sys
 import tempfile
 import textwrap
@@ -16,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterator, List, Optional
 
 sys.path.insert(0, os.path.dirname(__file__))
-from json_format import dumps_v2_json
+from json_format import dumps_tree_json
 from task_tree_schema import (
     ACTIONABLE_STATUSES,
     VALID_STATUSES,
@@ -33,6 +34,47 @@ STATUS_ICONS = {
 }
 
 MAX_FULL_CHILDREN_JSON_LINES = 200
+
+
+class ExclusiveTreeTransaction:
+    """One explicitly finalized tree mutation under an exclusive store lock."""
+
+    def __init__(self, store: "TaskTreeStore", data: Dict) -> None:
+        self.store = store
+        self.data = data
+        self._finalized = False
+        self._closed = False
+
+    @property
+    def finalized(self) -> bool:
+        return self._finalized
+
+    def _require_open_unfinalized(self) -> None:
+        if self._closed:
+            raise RuntimeError("tree transaction is closed")
+        if self._finalized:
+            raise RuntimeError("tree transaction already has a commit point")
+
+    def commit(self) -> None:
+        """Durably replace the tree JSON exactly once while retaining the lock."""
+
+        self._require_open_unfinalized()
+        # Finalize before I/O because an error after os.replace may still mean
+        # the new tree is visible. Retrying inside the same lock scope would
+        # create a second, ambiguous commit point.
+        self._finalized = True
+        self.store._write_unlocked(self.data)
+
+    def drop_tree(self) -> bool:
+        """Durably remove the tree JSON exactly once while retaining the lock."""
+
+        self._require_open_unfinalized()
+        self._finalized = True
+        removed = self.store.remove_tree_file_unlocked()
+        return removed
+
+    def _close(self) -> None:
+        self._closed = True
 
 
 @dataclass
@@ -69,10 +111,33 @@ class TaskTreeStore:
         validate_tree(data)
         directory = os.path.dirname(self.path) or "."
         os.makedirs(directory, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=False) as tmp:
-            tmp.write(dumps_v2_json(data))
-            tmp_path = tmp.name
-        os.replace(tmp_path, self.path)
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=directory, delete=False
+            ) as tmp:
+                tmp_path = tmp.name
+                tmp.write(dumps_tree_json(data))
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_path, self.path)
+            tmp_path = None
+            self._fsync_directory_unlocked(directory)
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except FileNotFoundError:
+                    pass
+
+    @staticmethod
+    def _fsync_directory_unlocked(directory: str) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(directory, flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def reset_unlocked(self) -> Dict:
         data = self._empty_data()
@@ -83,10 +148,51 @@ class TaskTreeStore:
         if not os.path.exists(self.path):
             return False
         os.remove(self.path)
+        self._fsync_directory_unlocked(os.path.dirname(self.path) or ".")
         return True
 
     @contextmanager
+    def locked_transaction(
+        self, validate_active: bool = True, read_tree: bool = True
+    ) -> Iterator[ExclusiveTreeTransaction]:
+        """Yield a one-shot explicit transaction while holding the write lock.
+
+        The caller selects the commit point with ``commit`` or ``drop_tree``.
+        Exiting without either operation leaves the persisted tree unchanged.
+        The lock remains held after finalization until the context exits so a
+        caller may safely perform post-commit filesystem cleanup. Whole-store
+        reset/drop recovery may set ``read_tree`` false to replace an invalid
+        tree without first loading it.
+        """
+
+        lock_dir = os.path.dirname(self.lock_path) or "."
+        os.makedirs(lock_dir, exist_ok=True)
+        with open(self.lock_path, "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            transaction: Optional[ExclusiveTreeTransaction] = None
+            try:
+                if read_tree:
+                    data, _ = self._read_unlocked(validate_active=validate_active)
+                else:
+                    data = self._empty_data()
+                transaction = ExclusiveTreeTransaction(self, data)
+                yield transaction
+            finally:
+                if transaction is not None:
+                    transaction._close()
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
     def locked_data(self, write: bool = False, validate_active: bool = True) -> Iterator[Dict]:
+        if write:
+            # Compatibility API for ordinary single-phase mutations. New
+            # multi-phase operations should use locked_transaction so their
+            # metadata commit point is explicit and the lock can span cleanup.
+            with self.locked_transaction(validate_active=validate_active) as transaction:
+                yield transaction.data
+                transaction.commit()
+            return
+
         lock_mode = fcntl.LOCK_EX if write else fcntl.LOCK_SH
         lock_dir = os.path.dirname(self.lock_path) or "."
         os.makedirs(lock_dir, exist_ok=True)
@@ -109,8 +215,6 @@ class TaskTreeStore:
                     self._write_unlocked(data)
             try:
                 yield data
-                if write:
-                    self._write_unlocked(data)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -166,7 +270,7 @@ def default_store(cli_tree_file: Optional[str] = None) -> TaskTreeStore:
     return TaskTreeStore(path)
 
 
-def legacy_store_environment_warning(cli_tree_file: Optional[str] = None) -> Optional[str]:
+def deprecated_store_environment_warning(cli_tree_file: Optional[str] = None) -> Optional[str]:
     path, environment_variable = store_path_selection(cli_tree_file)
     if environment_variable is None:
         return None
@@ -193,6 +297,443 @@ def shared_dir_for_store(store: TaskTreeStore) -> str:
 
 def task_files_dir_for_store(store: TaskTreeStore, node_id: int) -> str:
     return os.path.join(base_dir_for_store(store), "files", str(node_id))
+
+
+def managed_files_root_for_store(store: TaskTreeStore) -> str:
+    """Return the task-artifact root owned by the selected store."""
+
+    return os.path.join(base_dir_for_store(store), "files")
+
+
+def normalized_absolute_path(path: str) -> str:
+    """Normalize a stored path lexically without resolving symlinks."""
+
+    return os.path.abspath(os.path.normpath(path))
+
+
+def is_canonical_task_files_path(
+    store: TaskTreeStore, node_id: int, path: object
+) -> bool:
+    """Return whether *path* names this task's store-owned artifact directory."""
+
+    return isinstance(path, str) and normalized_absolute_path(path) == normalized_absolute_path(
+        task_files_dir_for_store(store, node_id)
+    )
+
+
+def canonical_positive_task_id(name: str) -> Optional[int]:
+    """Parse canonical positive-integer directory names only."""
+
+    if re.fullmatch(r"[1-9][0-9]*", name) is None:
+        return None
+    return int(name)
+
+
+def _artifact_record(path: str, *, task_id: Optional[int] = None, **fields: object) -> Dict:
+    record: Dict = {"path": path}
+    if task_id is not None:
+        record["task_id"] = task_id
+    record.update(fields)
+    return record
+
+
+def scan_managed_artifacts(store: TaskTreeStore, data: Dict) -> Dict:
+    """Classify store-owned artifact paths without following symlinks.
+
+    This function performs no locking itself. Callers must hold the selected
+    store's shared lock for inspection or exclusive lock for pruning.
+    """
+
+    files_root = managed_files_root_for_store(store)
+    inventory = {
+        "files_root": files_root,
+        "live": [],
+        "orphaned": [],
+        "suspicious": [],
+        "removed": [],
+        "failed": [],
+    }
+    live_references: Dict[int, str] = {}
+    for node in sorted(data["nodes"], key=lambda item: item["id"]):
+        stored_path = node.get("files_dir")
+        if not stored_path:
+            continue
+        if is_canonical_task_files_path(store, node["id"], stored_path):
+            live_references[node["id"]] = task_files_dir_for_store(store, node["id"])
+        else:
+            inventory["suspicious"].append(
+                _artifact_record(
+                    stored_path,
+                    task_id=node["id"],
+                    reason="files_dir is not the task's canonical managed path",
+                )
+            )
+
+    try:
+        root_status = os.lstat(files_root)
+    except FileNotFoundError:
+        for node_id, path in live_references.items():
+            inventory["suspicious"].append(
+                _artifact_record(
+                    path,
+                    task_id=node_id,
+                    reason="referenced managed directory is missing",
+                )
+            )
+        return _sort_artifact_inventory(inventory)
+    except OSError as exc:
+        inventory["suspicious"].append(
+            _artifact_record(files_root, reason=f"unable to inspect files root: {exc}")
+        )
+        return _sort_artifact_inventory(inventory)
+
+    if stat.S_ISLNK(root_status.st_mode):
+        inventory["suspicious"].append(
+            _artifact_record(files_root, reason="files root is a symlink")
+        )
+        return _sort_artifact_inventory(inventory)
+    if not stat.S_ISDIR(root_status.st_mode):
+        inventory["suspicious"].append(
+            _artifact_record(files_root, reason="files root is not a directory")
+        )
+        return _sort_artifact_inventory(inventory)
+
+    observed_task_ids = set()
+    try:
+        with os.scandir(files_root) as directory_entries:
+            entries = sorted(directory_entries, key=lambda entry: entry.name)
+    except OSError as exc:
+        inventory["suspicious"].append(
+            _artifact_record(files_root, reason=f"unable to scan files root: {exc}")
+        )
+        return _sort_artifact_inventory(inventory)
+
+    for entry in entries:
+        path = os.path.join(files_root, entry.name)
+        node_id = canonical_positive_task_id(entry.name)
+        if node_id is not None:
+            observed_task_ids.add(node_id)
+        try:
+            entry_status = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            inventory["suspicious"].append(
+                _artifact_record(path, task_id=node_id, reason=f"unable to inspect entry: {exc}")
+            )
+            continue
+        if stat.S_ISLNK(entry_status.st_mode):
+            inventory["suspicious"].append(
+                _artifact_record(path, task_id=node_id, reason="entry is a symlink")
+            )
+            continue
+        if not stat.S_ISDIR(entry_status.st_mode):
+            inventory["suspicious"].append(
+                _artifact_record(path, task_id=node_id, reason="entry is not a directory")
+            )
+            continue
+        if node_id is None:
+            inventory["suspicious"].append(
+                _artifact_record(path, reason="directory name is not a canonical positive task ID")
+            )
+            continue
+        record = _artifact_record(path, task_id=node_id)
+        if node_id in live_references:
+            inventory["live"].append(record)
+        else:
+            inventory["orphaned"].append(record)
+
+    for node_id, path in live_references.items():
+        if node_id not in observed_task_ids:
+            inventory["suspicious"].append(
+                _artifact_record(
+                    path,
+                    task_id=node_id,
+                    reason="referenced managed directory is missing",
+                )
+            )
+    return _sort_artifact_inventory(inventory)
+
+
+def _sort_artifact_inventory(inventory: Dict) -> Dict:
+    for field in ("live", "orphaned", "suspicious", "removed", "failed"):
+        inventory[field].sort(
+            key=lambda record: (
+                record.get("path", ""),
+                record.get("task_id", 0),
+                record.get("reason", ""),
+                record.get("error", ""),
+            )
+        )
+    return inventory
+
+
+def prune_orphaned_artifacts(store: TaskTreeStore, inventory: Dict) -> Dict:
+    """Remove only orphan paths previously proven to be canonical directories."""
+
+    for record in inventory["orphaned"]:
+        path = record["path"]
+        node_id = record["task_id"]
+        if not is_canonical_task_files_path(store, node_id, path):
+            inventory["failed"].append(
+                _artifact_record(path, task_id=node_id, error="path is no longer canonical")
+            )
+            continue
+        try:
+            path_status = os.lstat(path)
+            if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISDIR(path_status.st_mode):
+                inventory["failed"].append(
+                    _artifact_record(
+                        path,
+                        task_id=node_id,
+                        error="path is no longer a non-symlink directory",
+                    )
+                )
+                continue
+            shutil.rmtree(path)
+            inventory["removed"].append(_artifact_record(path, task_id=node_id))
+        except FileNotFoundError:
+            # A cooperating process cannot race under the exclusive lock, but
+            # external cleanup is harmless and still leaves the target pruned.
+            inventory["removed"].append(_artifact_record(path, task_id=node_id))
+        except OSError as exc:
+            inventory["failed"].append(
+                _artifact_record(path, task_id=node_id, error=str(exc))
+            )
+    _sort_artifact_inventory(inventory)
+    files_root = inventory["files_root"]
+    try:
+        os.rmdir(files_root)
+    except (FileNotFoundError, OSError):
+        pass
+    return inventory
+
+
+def render_artifact_inventory(inventory: Dict) -> str:
+    lines = [f"files_root: {inventory['files_root']}"]
+    for field in ("live", "orphaned", "suspicious", "removed", "failed"):
+        records = inventory[field]
+        lines.append(f"{field} ({len(records)}):")
+        if not records:
+            lines.append("  (none)")
+            continue
+        for record in records:
+            task_label = (
+                f"task {record['task_id']}: " if "task_id" in record else ""
+            )
+            detail = record.get("reason") or record.get("error")
+            suffix = f" [{detail}]" if detail else ""
+            lines.append(f"  - {task_label}{record['path']}{suffix}")
+    lines.append(
+        "summary: "
+        + " ".join(
+            f"{field}={len(inventory[field])}"
+            for field in ("live", "orphaned", "suspicious", "removed", "failed")
+        )
+    )
+    return "\n".join(lines)
+
+
+def empty_cleanup_result() -> Dict:
+    return {
+        "requested": [],
+        "removed": [],
+        "absent": [],
+        "unmanaged": [],
+        "failed": [],
+    }
+
+
+def _cleanup_record(
+    path: str, *, kind: str, task_id: Optional[int] = None, **fields: object
+) -> Dict:
+    record: Dict = {"kind": kind, "path": path}
+    if task_id is not None:
+        record["task_id"] = task_id
+    record.update(fields)
+    return record
+
+
+def _sort_cleanup_result(cleanup: Dict) -> Dict:
+    for field in ("requested", "removed", "absent", "unmanaged", "failed"):
+        cleanup[field].sort(
+            key=lambda record: (
+                record.get("path", ""),
+                record.get("task_id", 0),
+                record.get("reason", ""),
+                record.get("error", ""),
+            )
+        )
+    return cleanup
+
+
+def plan_task_artifact_cleanup(
+    store: TaskTreeStore,
+    node_id: int,
+    path: str,
+    cleanup: Dict,
+) -> Optional[Dict]:
+    """Record a requested task cleanup and return a safe executable plan item."""
+
+    if not is_canonical_task_files_path(store, node_id, path):
+        cleanup["requested"].append(
+            _cleanup_record(path, kind="task", task_id=node_id)
+        )
+        cleanup["unmanaged"].append(
+            _cleanup_record(
+                path,
+                kind="task",
+                task_id=node_id,
+                reason="files_dir is not the task's canonical managed path",
+            )
+        )
+        return None
+    # Use only the store-derived spelling for I/O. A user-edited spelling can
+    # normalize lexically to the same path while resolving differently if a
+    # symlink occurs before a ``..`` component.
+    requested = _cleanup_record(
+        task_files_dir_for_store(store, node_id),
+        kind="task",
+        task_id=node_id,
+    )
+    cleanup["requested"].append(requested)
+    return requested
+
+
+def _remove_planned_directory(record: Dict, cleanup: Dict) -> None:
+    """Best-effort removal after ownership was established during planning."""
+
+    path = record["path"]
+    try:
+        path_status = os.lstat(path)
+    except FileNotFoundError:
+        cleanup["absent"].append(dict(record))
+        return
+    except OSError as exc:
+        cleanup["failed"].append(_cleanup_record(**record, error=str(exc)))
+        return
+
+    if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISDIR(path_status.st_mode):
+        cleanup["failed"].append(
+            _cleanup_record(
+                **record,
+                error="path is not a non-symlink directory",
+            )
+        )
+        return
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        cleanup["absent"].append(dict(record))
+    except OSError as exc:
+        if os.path.lexists(path):
+            cleanup["failed"].append(_cleanup_record(**record, error=str(exc)))
+        else:
+            cleanup["removed"].append(dict(record))
+    else:
+        cleanup["removed"].append(dict(record))
+
+
+def execute_task_cleanup_plan(
+    store: TaskTreeStore, plan: List[Dict], cleanup: Dict
+) -> Dict:
+    """Revalidate canonical ownership and remove task directories under lock."""
+
+    files_root = managed_files_root_for_store(store)
+    if plan:
+        try:
+            root_status = os.lstat(files_root)
+        except FileNotFoundError:
+            cleanup["absent"].extend(dict(record) for record in plan)
+            return _sort_cleanup_result(cleanup)
+        except OSError as exc:
+            cleanup["failed"].extend(
+                _cleanup_record(**record, error=f"unable to inspect files root: {exc}")
+                for record in plan
+            )
+            return _sort_cleanup_result(cleanup)
+        if stat.S_ISLNK(root_status.st_mode) or not stat.S_ISDIR(root_status.st_mode):
+            cleanup["failed"].extend(
+                _cleanup_record(
+                    **record,
+                    error="managed files root is not a non-symlink directory",
+                )
+                for record in plan
+            )
+            return _sort_cleanup_result(cleanup)
+
+    for record in plan:
+        if not is_canonical_task_files_path(
+            store, record["task_id"], record["path"]
+        ):
+            cleanup["failed"].append(
+                _cleanup_record(
+                    **record,
+                    error="path is no longer canonical for this task",
+                )
+            )
+            continue
+        _remove_planned_directory(record, cleanup)
+    try:
+        os.rmdir(files_root)
+    except OSError:
+        pass
+    return _sort_cleanup_result(cleanup)
+
+
+def cleanup_all_managed_task_artifacts(store: TaskTreeStore, cleanup: Dict) -> Dict:
+    """Remove every canonical orphan after a whole-tree metadata commit."""
+
+    inventory = scan_managed_artifacts(store, store._empty_data())
+    plan = []
+    for orphan in inventory["orphaned"]:
+        planned = plan_task_artifact_cleanup(
+            store, orphan["task_id"], orphan["path"], cleanup
+        )
+        if planned is not None:
+            plan.append(planned)
+    for suspicious in inventory["suspicious"]:
+        record = _cleanup_record(
+            suspicious["path"],
+            kind="task-files",
+            task_id=suspicious.get("task_id"),
+        )
+        cleanup["requested"].append(record)
+        cleanup["unmanaged"].append(
+            _cleanup_record(
+                **record,
+                reason=suspicious["reason"],
+            )
+        )
+    return execute_task_cleanup_plan(store, plan, cleanup)
+
+
+def plan_shared_artifact_cleanup(store: TaskTreeStore, cleanup: Dict) -> Dict:
+    record = _cleanup_record(shared_dir_for_store(store), kind="shared")
+    cleanup["requested"].append(record)
+    return record
+
+
+def cleanup_has_pending_work(cleanup: Dict) -> bool:
+    return bool(cleanup["unmanaged"] or cleanup["failed"])
+
+
+def render_cleanup_result(cleanup: Dict) -> str:
+    lines = [
+        "cleanup: "
+        + " ".join(
+            f"{field}={len(cleanup[field])}"
+            for field in ("requested", "removed", "absent", "unmanaged", "failed")
+        )
+    ]
+    for field in ("unmanaged", "failed"):
+        for record in cleanup[field]:
+            detail = record.get("reason") or record.get("error")
+            lines.append(f"  {field}: {record['path']} [{detail}]")
+    if cleanup_has_pending_work(cleanup):
+        lines.append(
+            "metadata committed; cleanup remains pending. Inspect retained paths; "
+            "use scan-files --prune for managed task artifacts."
+        )
+    return "\n".join(lines)
 
 
 # Detailed task output is for orientation, not directory traversal. Ten paths
@@ -234,13 +775,6 @@ def ensure_dir(path: str) -> str:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def remove_dir_if_exists(path: str) -> bool:
-    if not path or not os.path.exists(path):
-        return False
-    shutil.rmtree(path)
-    return True
 
 
 def ensure_node_events(node: Dict) -> Dict:
@@ -639,7 +1173,7 @@ def status_snapshot_to_dict(store: TaskTreeStore, data: Dict) -> Dict:
     payload.update(
         {
             # Preserve the former active --json record inside the richer
-            # snapshot payload so migration changes only its enclosing path.
+            # snapshot payload so the API expansion changes only its enclosing path.
             "active": node_to_dict(store, active, active_id, data),
             "parent": snapshot_context_reference(parent),
             "previous_sibling": snapshot_context_reference(previous_node),
@@ -661,7 +1195,7 @@ def render_mutation_result(store: TaskTreeStore, data: Dict, *, full_tree: bool)
 def node_to_dict(
     store: TaskTreeStore, node: Dict, active_id: Optional[int], data: Dict
 ) -> Dict:
-    # The JSON view derives relationship metadata for callers; v2 never
+    # The JSON view derives relationship metadata for callers; the store never
     # persists these compatibility fields on the child record.
     siblings = sibling_nodes(data, node["id"])
     return {
@@ -901,19 +1435,6 @@ def choose_next_task(data: Dict, relative_to_id: Optional[int] = None) -> Option
     return None
 
 
-def prune_empty_dirs(path: str) -> None:
-    current = path
-    while current and os.path.isdir(current):
-        try:
-            os.rmdir(current)
-        except OSError:
-            return
-        parent = os.path.dirname(current)
-        if parent == current:
-            return
-        current = parent
-
-
 def parse_iso8601(ts: Optional[str]) -> Optional[datetime]:
     if not ts or not isinstance(ts, str):
         return None
@@ -974,13 +1495,90 @@ def parse_nonnegative_int(value: str) -> int:
     return parsed
 
 
+def load_partition_steps(path: str) -> List[Dict[str, str]]:
+    try:
+        with open(path, "r", encoding="utf-8") as input_file:
+            payload = json.load(input_file)
+    except OSError as exc:
+        raise ValueError(f"unable to read partition input {path!r}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid partition JSON in {path!r}: {exc.msg}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("partition input must be a JSON object")
+    if set(payload) != {"schema_version", "steps"}:
+        raise ValueError(
+            "partition input must contain exactly schema_version and steps"
+        )
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise ValueError("partition schema_version must be integer 1")
+    steps = payload["steps"]
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("partition steps must be a non-empty array")
+
+    validated_steps: List[Dict[str, str]] = []
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            raise ValueError(f"partition step {index} must be an object")
+        if set(step) != {"summary", "body"}:
+            raise ValueError(
+                f"partition step {index} must contain exactly summary and body"
+            )
+        summary = step["summary"]
+        body = step["body"]
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError(
+                f"partition step {index} summary must be a non-empty string"
+            )
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError(
+                f"partition step {index} body must be a non-empty string"
+            )
+        validated_steps.append({"summary": summary, "body": body})
+    return validated_steps
+
+
 def ensure_task_files_dir(store: TaskTreeStore, node: Dict, timestamp: Optional[str] = None) -> str:
     files_dir = node.get("files_dir")
-    if not files_dir:
-        files_dir = task_files_dir_for_store(store, node["id"])
-        node["files_dir"] = files_dir
-        stamp_event(node, "files_created_at", timestamp)
-    return ensure_dir(files_dir)
+    canonical_path = task_files_dir_for_store(store, node["id"])
+    if files_dir and not is_canonical_task_files_path(store, node["id"], files_dir):
+        raise ValueError(
+            f"task {node['id']} files_dir {files_dir!r} is unmanaged; "
+            f"expected {canonical_path!r}"
+        )
+
+    files_root = managed_files_root_for_store(store)
+    if os.path.lexists(files_root):
+        root_status = os.lstat(files_root)
+        if stat.S_ISLNK(root_status.st_mode) or not stat.S_ISDIR(root_status.st_mode):
+            raise ValueError(
+                f"managed files root {files_root!r} is not a non-symlink directory"
+            )
+    else:
+        os.makedirs(files_root, exist_ok=False)
+
+    if files_dir:
+        if os.path.lexists(canonical_path):
+            path_status = os.lstat(canonical_path)
+            if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISDIR(path_status.st_mode):
+                raise ValueError(
+                    f"task {node['id']} files_dir {files_dir!r} is not a "
+                    "non-symlink directory"
+                )
+        else:
+            os.mkdir(canonical_path)
+        return files_dir
+
+    try:
+        os.mkdir(canonical_path)
+    except FileExistsError as exc:
+        raise ValueError(
+            f"artifact path collision for task {node['id']}: {canonical_path!r} "
+            "already exists; inspect it or run scan-files --prune before attaching files"
+        ) from exc
+    node["files_dir"] = canonical_path
+    stamp_event(node, "files_created_at", timestamp)
+    return canonical_path
 
 
 def build_event_record(args: argparse.Namespace, event_name: str) -> Dict:
@@ -1127,7 +1725,8 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def cmd_add(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
-    with store.locked_data(write=True) as data:
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         if args.parent is not None:
             require_node(data, args.parent)
         if args.return_to is not None:
@@ -1158,16 +1757,59 @@ def cmd_add(args: argparse.Namespace) -> int:
                 parent["closeout_reviewed"] = False
                 stamp_event(parent, "closeout_reviewed_updated_at", created_at)
         if args.with_files:
-            node["files_dir"] = task_files_dir_for_store(store, node["id"])
-            ensure_dir(node["files_dir"])
-            stamp_event(node, "files_created_at")
+            ensure_task_files_dir(store, node, created_at)
         if args.set_active:
             set_active_node(data, node)
         if args.details:
-            print(render_node_details(store, node, data))
+            output = render_node_details(store, node, data)
         else:
-            print(render_mutation_result(store, data, full_tree=args.full_tree))
-        return 0
+            output = render_mutation_result(store, data, full_tree=args.full_tree)
+        transaction.commit()
+    print(output)
+    return 0
+
+
+def cmd_partition(args: argparse.Namespace) -> int:
+    steps = load_partition_steps(args.from_file)
+    store = default_store(args.tree_file)
+    with store.locked_transaction() as transaction:
+        data = transaction.data
+        parent = require_node(data, args.parent_id)
+        new_nodes: List[Dict] = []
+        next_id = data["next_id"]
+        for step in steps:
+            node = {
+                "id": next_id,
+                "children": [],
+                "summary": step["summary"],
+                "body": step["body"],
+                "status": "not_started",
+                "closeout_reviewed": False,
+                "files_dir": None,
+                "events": {},
+            }
+            created_at = utc_now()
+            stamp_event(node, "created_at", created_at)
+            stamp_event(node, "status_changed_at", created_at)
+            stamp_event(node, "body_updated_at", created_at)
+            new_nodes.append(node)
+            next_id += 1
+
+        data["next_id"] = next_id
+        data["nodes"].extend(new_nodes)
+        parent["children"].extend(node["id"] for node in new_nodes)
+
+        created_at = new_nodes[0]["events"]["created_at"]
+        if parent.get("closeout_reviewed", False):
+            parent["closeout_reviewed"] = False
+            stamp_event(parent, "closeout_reviewed_updated_at", created_at)
+        if args.set_active_first:
+            set_active_node(data, new_nodes[0])
+
+        output = render_mutation_result(store, data, full_tree=args.full_tree)
+        transaction.commit()
+    print(output)
+    return 0
 
 
 def cmd_update(args: argparse.Namespace) -> int:
@@ -1198,7 +1840,8 @@ def cmd_update(args: argparse.Namespace) -> int:
         body = args.body
 
     store = default_store(args.tree_file)
-    with store.locked_data(write=True) as data:
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         node = require_node(data, args.node_id)
         if args.summary is not None:
             node["summary"] = args.summary
@@ -1227,10 +1870,12 @@ def cmd_update(args: argparse.Namespace) -> int:
                     stamp_event(parent, "closeout_reviewed_updated_at")
             advance_active_after_terminal_transition(data, node, previous_status)
         if args.details:
-            print(render_node_details(store, node, data))
+            output = render_node_details(store, node, data)
         else:
-            print(render_mutation_result(store, data, full_tree=args.full_tree))
-        return 0
+            output = render_mutation_result(store, data, full_tree=args.full_tree)
+        transaction.commit()
+    print(output)
+    return 0
 
 
 def cmd_active(args: argparse.Namespace) -> int:
@@ -1250,19 +1895,25 @@ def cmd_active(args: argparse.Namespace) -> int:
 
 def cmd_set_active(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
-    with store.locked_data(write=True) as data:
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         node = require_node(data, args.node_id)
         set_active_node(data, node)
-        print(render_mutation_result(store, data, full_tree=args.full_tree))
-        return 0
+        output = render_mutation_result(store, data, full_tree=args.full_tree)
+        transaction.commit()
+    print(output)
+    return 0
 
 
 def cmd_clear_active(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
-    with store.locked_data(write=True, validate_active=False) as data:
+    with store.locked_transaction(validate_active=False) as transaction:
+        data = transaction.data
         data["active_id"] = None
-        print(render_mutation_result(store, data, full_tree=args.full_tree))
-        return 0
+        output = render_mutation_result(store, data, full_tree=args.full_tree)
+        transaction.commit()
+    print(output)
+    return 0
 
 
 def cmd_path(args: argparse.Namespace) -> int:
@@ -1275,15 +1926,19 @@ def cmd_path(args: argparse.Namespace) -> int:
 
 def cmd_move(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
-    with store.locked_data(write=True) as data:
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         relocate_node(data, args.node_id, args.parent)
-        print(render_mutation_result(store, data, full_tree=args.full_tree))
-        return 0
+        output = render_mutation_result(store, data, full_tree=args.full_tree)
+        transaction.commit()
+    print(output)
+    return 0
 
 
 def cmd_reorder(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
-    with store.locked_data(write=True) as data:
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         node = require_node(data, args.node_id)
         node_parent_id = parent_id_for(data, node["id"])
         siblings = [sibling_id for sibling_id in owning_id_list(data, node["id"]) if sibling_id != node["id"]]
@@ -1312,13 +1967,18 @@ def cmd_reorder(args: argparse.Namespace) -> int:
             before_id=before_id,
             after_id=after_id,
         )
-        print(render_mutation_result(store, data, full_tree=args.full_tree))
-        return 0
+        output = render_mutation_result(store, data, full_tree=args.full_tree)
+        transaction.commit()
+    print(output)
+    return 0
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
-    with store.locked_data(write=True) as data:
+    cleanup = empty_cleanup_result()
+    cleanup_plan: List[Dict] = []
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         node = require_node(data, args.node_id)
         parent_id = parent_id_for(data, node["id"])
         doomed = set(subtree_ids(data, args.node_id))
@@ -1336,13 +1996,14 @@ def cmd_delete(args: argparse.Namespace) -> int:
                 "Refusing to delete return target; clear or rewrite return_to_id "
                 f"on task(s): {rendered}"
             )
-        for node_id in doomed:
-            node = require_node(data, node_id)
-            if node.get("files_dir"):
-                removed = remove_dir_if_exists(node["files_dir"])
-                if removed:
-                    stamp_event(node, "files_pruned_at")
-                node["files_dir"] = None
+        for node_id in sorted(doomed):
+            doomed_node = require_node(data, node_id)
+            if doomed_node.get("files_dir"):
+                planned = plan_task_artifact_cleanup(
+                    store, node_id, doomed_node["files_dir"], cleanup
+                )
+                if planned is not None:
+                    cleanup_plan.append(planned)
         owning_id_list(data, args.node_id).remove(args.node_id)
         data["nodes"] = [node for node in data["nodes"] if node["id"] not in doomed]
         if parent_id is not None and parent_id not in doomed:
@@ -1352,10 +2013,29 @@ def cmd_delete(args: argparse.Namespace) -> int:
                 stamp_event(parent, "closeout_reviewed_updated_at")
         if data["active_id"] in doomed:
             data["active_id"] = None
-        files_root = os.path.join(base_dir_for_store(store), "files")
-        prune_empty_dirs(files_root)
-        print(render_mutation_result(store, data, full_tree=args.full_tree))
-        return 0
+        transaction.commit()
+        execute_task_cleanup_plan(store, cleanup_plan, cleanup)
+        if args.json:
+            output = json.dumps(
+                {
+                    "command": "delete",
+                    "metadata_committed": True,
+                    "deleted_ids": sorted(doomed),
+                    "tree": data,
+                    "cleanup": cleanup,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        else:
+            output = "\n".join(
+                (
+                    render_mutation_result(store, data, full_tree=args.full_tree),
+                    render_cleanup_result(cleanup),
+                )
+            )
+    print(output)
+    return 1 if cleanup_has_pending_work(cleanup) else 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -1484,21 +2164,27 @@ def cmd_next(args: argparse.Namespace) -> int:
 
 def cmd_ensure_files(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
-    with store.locked_data(write=True) as data:
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         node = require_node(data, args.node_id)
-        print(ensure_task_files_dir(store, node))
-        return 0
+        output = ensure_task_files_dir(store, node)
+        transaction.commit()
+    print(output)
+    return 0
 
 
 def cmd_log_event(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
     record = build_event_record(args, args.event)
-    with store.locked_data(write=True) as data:
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         node = require_node(data, args.node_id)
         log_path = os.path.join(ensure_task_files_dir(store, node, record["ts"]), "events.jsonl")
         append_event_record(log_path, record)
-        print(render_event_log_text(log_path, [record]))
-        return 0
+        output = render_event_log_text(log_path, [record])
+        transaction.commit()
+    print(output)
+    return 0
 
 
 def cmd_event_log(args: argparse.Namespace) -> int:
@@ -1532,33 +2218,71 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
 
     store = default_store(args.tree_file)
     record = build_event_record(args, "checkpoint")
-    with store.locked_data(write=True) as data:
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         node = require_node(data, args.node_id)
         if body is not None:
             node["body"] = body
             stamp_event(node, "body_updated_at", record["ts"])
         log_path = os.path.join(ensure_task_files_dir(store, node, record["ts"]), "events.jsonl")
         append_event_record(log_path, record)
-        print(render_event_log_text(log_path, [record]))
-        return 0
+        output = render_event_log_text(log_path, [record])
+        transaction.commit()
+    print(output)
+    return 0
 
 
 def cmd_prune_files(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
-    with store.locked_data(write=True) as data:
+    cleanup = empty_cleanup_result()
+    cleanup_plan: List[Dict] = []
+    with store.locked_transaction() as transaction:
+        data = transaction.data
         node = require_node(data, args.node_id)
         files_dir = node.get("files_dir")
-        if not files_dir:
-            print("(no files_dir set)")
-            return 0
-        removed = remove_dir_if_exists(files_dir)
-        node["files_dir"] = None
-        if removed:
-            stamp_event(node, "files_pruned_at")
-        print(f"removed: {removed}")
-        files_root = os.path.join(base_dir_for_store(store), "files")
-        prune_empty_dirs(files_root)
-        return 0
+        cleanup_path = files_dir or task_files_dir_for_store(store, node["id"])
+        planned = plan_task_artifact_cleanup(
+            store, node["id"], cleanup_path, cleanup
+        )
+        if planned is not None:
+            cleanup_plan.append(planned)
+        if files_dir:
+            node["files_dir"] = None
+            stamp_event(node, "files_detached_at")
+        transaction.commit()
+        execute_task_cleanup_plan(store, cleanup_plan, cleanup)
+        if args.json:
+            output = json.dumps(
+                {
+                    "command": "prune-files",
+                    "metadata_committed": True,
+                    "task_id": node["id"],
+                    "files_dir": node["files_dir"],
+                    "cleanup": cleanup,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        else:
+            output = render_cleanup_result(cleanup)
+    print(output)
+    return 1 if cleanup_has_pending_work(cleanup) else 0
+
+
+def cmd_scan_files(args: argparse.Namespace) -> int:
+    store = default_store(args.tree_file)
+    if args.prune:
+        with store.locked_transaction() as transaction:
+            inventory = scan_managed_artifacts(store, transaction.data)
+            prune_orphaned_artifacts(store, inventory)
+    else:
+        with store.locked_data() as data:
+            inventory = scan_managed_artifacts(store, data)
+    if args.json:
+        print(json.dumps(inventory, indent=2, ensure_ascii=False))
+    else:
+        print(render_artifact_inventory(inventory))
+    return 1 if inventory["failed"] else 0
 
 
 def cmd_shared_dir(args: argparse.Namespace) -> int:
@@ -1569,21 +2293,37 @@ def cmd_shared_dir(args: argparse.Namespace) -> int:
 
 def cmd_clear(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
-    lock_dir = os.path.dirname(store.lock_path) or "."
-    os.makedirs(lock_dir, exist_ok=True)
-    with open(store.lock_path, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        if args.prune_files:
-            remove_dir_if_exists(os.path.join(base_dir_for_store(store), "files"))
-        if args.prune_shared:
-            remove_dir_if_exists(shared_dir_for_store(store))
+    cleanup = empty_cleanup_result()
+    tree_file_removed = False
+    with store.locked_transaction(read_tree=False) as transaction:
         if args.drop_file:
-            store.remove_tree_file_unlocked()
+            tree_file_removed = transaction.drop_tree()
         else:
-            store.reset_unlocked()
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        print("(empty tree)")
-        return 0
+            transaction.data.clear()
+            transaction.data.update(store._empty_data())
+            transaction.commit()
+        if args.prune_files:
+            cleanup_all_managed_task_artifacts(store, cleanup)
+        if args.prune_shared:
+            shared_plan = plan_shared_artifact_cleanup(store, cleanup)
+            _remove_planned_directory(shared_plan, cleanup)
+            _sort_cleanup_result(cleanup)
+        if args.json:
+            output = json.dumps(
+                {
+                    "command": args.command,
+                    "metadata_committed": True,
+                    "tree_file_removed": tree_file_removed,
+                    "tree": None if args.drop_file else transaction.data,
+                    "cleanup": cleanup,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        else:
+            output = "\n".join(("(empty tree)", render_cleanup_result(cleanup)))
+    print(output)
+    return 1 if cleanup_has_pending_work(cleanup) else 0
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
@@ -1704,6 +2444,7 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser: argparse.ArgumentParser,
         *,
         include_details: bool = False,
+        include_json: bool = False,
     ) -> None:
         # Compact output is the safe default because real task trees can be
         # large enough for a routine mutation to flood the caller's context.
@@ -1711,6 +2452,8 @@ def build_parser() -> argparse.ArgumentParser:
         if include_details:
             output.add_argument("--details", action="store_true", help="Print the affected task's full details instead of a compact snapshot.")
         output.add_argument("--full-tree", action="store_true", help="Print the full tree instead of a compact snapshot after the mutation.")
+        if include_json:
+            output.add_argument("--json", action="store_true", help="Emit the committed tree and cleanup result as JSON rather than text.")
 
     snapshot = add_command(
         "snapshot",
@@ -1728,8 +2471,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Open the interactive terminal viewer. Navigate with the mouse or "
             "arrow keys. Move a task by (i) selecting it and pressing `m` or "
             "(ii) click-and-drag it. Then go to target location: "
-            "click/drop left-half ot task text to insert after it, or "
-            "or right-half to add as a child. Press `u` to undo move."
+            "click/drop the left half of task text to insert after it, or the "
+            "right half to add as a child. Press `U` or `Ctrl+Z` to undo."
         ),
     )
     tui.set_defaults(func=cmd_tui)
@@ -1748,9 +2491,41 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--return-to", dest="return_to", type=int, metavar="ID", help="After this task's subtree finishes, return focus to ID.")
     add.add_argument("--status", default="not_started", choices=VALID_STATUSES, metavar="STATUS", help="Set the initial task status.")
     add.add_argument("--set-active", action="store_true", help="Make the new task active.")
-    add.add_argument("--with-files", action="store_true", help="Create the new task's artifact directory.")
+    add.add_argument(
+        "--with-files",
+        action="store_true",
+        help=(
+            "Create the new task's canonical artifact directory; refuse to "
+            "adopt a pre-existing path."
+        ),
+    )
     add_mutation_output_arguments(add, include_details=True)
     add.set_defaults(func=cmd_add)
+
+    partition = add_command(
+        "partition",
+        "partition <parent-id>",
+        help="Add ordered child tasks from a validated JSON partition file",
+    )
+    partition.add_argument(
+        "parent_id",
+        type=int,
+        metavar="PARENT-ID",
+        help="Append the new tasks as children of this task.",
+    )
+    partition.add_argument(
+        "--from-file",
+        required=True,
+        metavar="PATH",
+        help="Read the schema-versioned partition steps from PATH.",
+    )
+    partition.add_argument(
+        "--set-active-first",
+        action="store_true",
+        help="Make the first newly created child active.",
+    )
+    add_mutation_output_arguments(partition)
+    partition.set_defaults(func=cmd_partition)
 
     update = add_command(
         "update",
@@ -1820,7 +2595,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_mutation_output_arguments(reorder)
     reorder.set_defaults(func=cmd_reorder)
 
-    delete = add_command("delete", "delete <id>", help="Delete a task or subtree")
+    delete = add_command(
+        "delete",
+        "delete <id>",
+        help="Delete a task or subtree",
+        description=(
+            "Commit subtree deletion before best-effort cleanup of referenced "
+            "canonical task artifact directories. Metadata and directory "
+            "cleanup are crash-consistent and recoverable, not one atomic "
+            "transaction. Exit 1 means metadata committed with retained paths; "
+            "inspect them and use scan-files --prune for managed orphans."
+        ),
+    )
     delete.add_argument("node_id", type=int, metavar="ID", help="Identify the task or subtree to delete.")
     delete.add_argument(
         "--force",
@@ -1830,7 +2616,7 @@ def build_parser() -> argparse.ArgumentParser:
             "references still block deletion."
         ),
     )
-    add_mutation_output_arguments(delete)
+    add_mutation_output_arguments(delete, include_json=True)
     delete.set_defaults(func=cmd_delete)
 
     list_cmd = add_command("list", "list", help="List tasks flat, optionally filtered by status")
@@ -1862,10 +2648,13 @@ def build_parser() -> argparse.ArgumentParser:
             "return_to_updated_at",
             "moved_at",
             "files_created_at",
-            "files_pruned_at",
+            "files_detached_at",
             "last_mutated_at",
         ],
-        help="Choose the lifecycle timestamp used with --since-days.",
+        help=(
+            "Choose the lifecycle timestamp used with --since-days; artifact "
+            "detachment uses files_detached_at."
+        ),
     )
     query_cmd.add_argument("--since-days", type=float, metavar="DAYS", help="Include tasks whose chosen timestamp is within DAYS.")
     query_output = query_cmd.add_mutually_exclusive_group()
@@ -1895,6 +2684,11 @@ def build_parser() -> argparse.ArgumentParser:
         "ensure-files",
         "ensure-files <id>",
         help="Create and print the task-specific artifact directory",
+        description=(
+            "Create or reuse the task's attached canonical artifact directory. "
+            "If files_dir is null, refuse to adopt a pre-existing path; inspect "
+            "the collision or prune a confirmed orphan with scan-files --prune."
+        ),
     )
     ensure_files.add_argument("node_id", type=int, metavar="ID", help="Identify the task whose artifact directory to create.")
     ensure_files.set_defaults(func=cmd_ensure_files)
@@ -1927,27 +2721,75 @@ def build_parser() -> argparse.ArgumentParser:
     prune_files = add_command(
         "prune-files",
         "prune-files <id>",
-        help="Delete a task's artifact directory",
+        help="Detach and clean a task's managed artifact directory",
+        description=(
+            "Commit files_dir detachment before best-effort cleanup of the "
+            "canonical task directory. Re-running is idempotent. Exit 1 means "
+            "metadata committed with a retained unmanaged or failed path; use "
+            "scan-files --prune for managed orphan recovery."
+        ),
     )
-    prune_files.add_argument("node_id", type=int, metavar="ID", help="Identify the task whose artifact directory to delete.")
+    prune_files.add_argument("node_id", type=int, metavar="ID", help="Identify the task whose managed artifact directory to detach and clean.")
+    prune_files.add_argument("--json", action="store_true", help="Emit the committed detach and cleanup result as JSON rather than text.")
     prune_files.set_defaults(func=cmd_prune_files)
+
+    scan_files = add_command(
+        "scan-files",
+        "scan-files",
+        help="Inspect or prune managed task artifact directories",
+        description=(
+            "Classify immediate entries under the selected store's files root. "
+            "Only --prune removes orphaned canonical positive-ID directories. "
+            "Suspicious entries such as symlinks, files, nonnumeric names, and "
+            "noncanonical references are reported and retained."
+        ),
+    )
+    scan_files.add_argument(
+        "--prune",
+        action="store_true",
+        help="Remove orphaned canonical task artifact directories.",
+    )
+    scan_files.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the artifact inventory as JSON rather than text.",
+    )
+    scan_files.set_defaults(func=cmd_scan_files)
 
     shared_dir = add_command("shared-dir", "shared-dir", help="Show and create the shared artifact directory")
     shared_dir.set_defaults(func=cmd_shared_dir)
 
-    clear_cmd = add_command("clear", "clear", help="Clear the whole task tree")
-    clear_cmd.add_argument("--prune-files", action="store_true", help="Delete all task artifact directories.")
-    clear_cmd.add_argument("--prune-shared", action="store_true", help="Delete the shared artifact directory.")
+    clear_cmd = add_command(
+        "clear",
+        "clear",
+        help="Clear the whole task tree",
+        description=(
+            "Commit an empty tree, or durably remove its JSON with --drop-file, "
+            "before optional best-effort cleanup. Only canonical task "
+            "directories are removed; suspicious entries are reported and "
+            "retained. Exit 1 means metadata committed with cleanup pending."
+        ),
+    )
+    clear_cmd.add_argument("--prune-files", action="store_true", help="Delete canonical managed task artifact directories after the tree commit.")
+    clear_cmd.add_argument("--prune-shared", action="store_true", help="Delete the non-symlink shared artifact directory after the tree commit.")
     clear_cmd.add_argument("--drop-file", action="store_true", help="Delete the backing tree JSON file instead of resetting it.")
+    clear_cmd.add_argument("--json", action="store_true", help="Emit the committed clear and cleanup result as JSON rather than text.")
     clear_cmd.set_defaults(func=cmd_clear)
 
     reset_cmd = add_command(
         "reset",
         "reset",
-        help="Clear the tree and delete all task artifact directories",
+        help="Clear the tree and clean canonical task artifact directories",
+        description=(
+            "Commit an empty tree, or durably remove its JSON with --drop-file, "
+            "then perform the same conservative task-artifact cleanup as clear "
+            "--prune-files. Suspicious entries are reported and retained. Exit "
+            "1 means metadata committed with cleanup pending."
+        ),
     )
-    reset_cmd.add_argument("--prune-shared", action="store_true", help="Delete the shared artifact directory.")
+    reset_cmd.add_argument("--prune-shared", action="store_true", help="Delete the non-symlink shared artifact directory after the tree commit.")
     reset_cmd.add_argument("--drop-file", action="store_true", help="Delete the backing tree JSON file instead of resetting it.")
+    reset_cmd.add_argument("--json", action="store_true", help="Emit the committed reset and cleanup result as JSON rather than text.")
     reset_cmd.set_defaults(func=cmd_reset)
 
     parser.epilog = render_subcommand_option_reference(sub)
@@ -1958,7 +2800,7 @@ def main(argv: List[str]) -> int:
     parser = build_parser()
     parser.set_defaults(func=cmd_snapshot)
     args = parser.parse_args(argv)
-    warning = legacy_store_environment_warning(args.tree_file)
+    warning = deprecated_store_environment_warning(args.tree_file)
     if warning:
         print(warning, file=sys.stderr)
     if args.command == "active":

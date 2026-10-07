@@ -1,6 +1,6 @@
 ---
 name: task-tree
-description: Persist and inspect a project task tree so long-running work survives compaction, restarts, and session changes. Use to track subtasks, progress, and durable work breakdowns.
+description: Persist and inspect project task trees across sessions, compaction, restarts, and handoffs. Use for multi-session work or explicit `$task-tree` requests; not for short, single-turn todo lists.
 ---
 
 # Task Tree
@@ -13,15 +13,16 @@ explicitly overrides it.
 Use `scripts/task_tree.py` for every read and write; it is the task-tree API.
 If its CLI lacks an operation, inspect and extend it deliberately rather than
 editing the JSON directly. Before using an unfamiliar mutation flag, consult
-`--help` or the argument parser—do not guess.
+`task_tree.py --help`, `<command> --help`, or the argument parser—do not guess.
 
 The default tree is `./task_tree/tree.json`. Put `--tree-file PATH` before the
 command to select another tree. That selected file’s parent owns its `files/`,
-`shared/`, and lock artifacts. The runtime uses a filesystem lock and atomic
-writes; always use the script so concurrent changes serialize safely. The
-current parent-owned ordering schema never auto-migrates legacy trees; see
-[schema.md](references/schema.md) and [migration.md](references/migration.md)
-if it reports one.
+`shared/`, and lock artifacts. The runtime uses a filesystem lock and durable
+atomic replacement for the tree JSON; always use the script so concurrent
+changes serialize safely. Artifact-directory cleanup is a separate,
+crash-consistent step, not part of the atomic JSON replacement. It validates
+the current parent-owned ordering schema before every operation; see
+[schema.md](references/schema.md) when diagnosing a schema error.
 
 ## Inspecting State
 
@@ -37,6 +38,9 @@ previous and next siblings, and the next task after its subtree. Do not print
 the full tree unless the user asks or a narrow command cannot answer the
 question. Use `show <id> --details` for one node and `show` for the full tree.
 Use `--full-tree` after a mutation only when it is genuinely needed.
+
+Read [tui.md](references/tui.md) before using the optional interactive viewer;
+it covers its dependency, navigation, relocation, and session-local undo.
 
 Before choosing work, inspect the active task and/or run `next`. Keep one
 actionable task active when there is a clear focus. Do not jump to a sibling
@@ -54,9 +58,27 @@ Adding children does not make the parent complete or non-actionable.
 The frontier comprises tasks without children; it does not determine their
 status, readiness, or whether a parent has work of its own.
 
-For substantive work, read [task-sizing.md](references/task-sizing.md) before
-creating or starting it, and again when scope expands. Routine inspection,
-navigation, and status changes do not need that assessment.
+Before substantive execution, decide and record whether the objective is one
+coherent task or a staged parent. Stage it before implementation or delegation
+when it has multiple independently verifiable outcomes, delegation units,
+distinct phases, failure mechanisms, or useful checkpoint boundaries;
+otherwise keep one task. Use the
+[partition command](references/partitioning.md) to create an accepted
+staged plan atomically.
+
+In a staged plan, the parent retains the overall acceptance criteria and each
+child owns one useful, verifiable outcome with its validation and handoff. Put
+dependencies in sibling order, set the parent `in_progress`, and activate the
+first actionable child. Do not split work merely by file, test, command, or
+routine message. Advance only after reviewing and validating the child and
+taking any appropriate scoped checkpoint.
+
+Read [task-sizing.md](references/task-sizing.md) when staged boundaries or
+context fit are non-obvious, before assigning several delegated units, and
+whenever scope expands or an unexpected dependency, failure mechanism, or
+ownership boundary appears. Stop and repartition at such a boundary before
+continuing; the reference defines the detailed sizing, checkpoint, and handoff
+procedure.
 
 To place new work, start with the compact snapshot. The active task’s details,
 its parent, and nearby sibling titles normally provide enough context:
@@ -70,22 +92,16 @@ its parent, and nearby sibling titles normally provide enough context:
 Read `show <id> --details` only when a body or closeout criteria are required
 to resolve ownership. Ask the user only if that focused inspection remains
 ambiguous. Titles route initially; they are not proof of ownership. For ordered
-insertion rules, read [execution-order.md](references/execution-order.md).
+insertion, placement, and traversal rules, read
+[ordering-and-traversal.md](references/ordering-and-traversal.md).
 
 ### Temporary switches
 
-When the user clearly asks to *temporarily* switch to work outside the current
-subtree, or otherwise clearly describes an interruption, create and activate
-the new task with `--return-to <current-id> --set-active`. Parentage and return
-continuation are independent: urgent work may belong under another workstream
-while returning focus to the interrupted task after its whole subtree is
-terminal.
-
-Do not set a return pointer for an explicit permanent reprioritization. If the
-request does not establish whether the switch is temporary, ask whether the
-user wants to resume the current task afterward. See
-[execution-order.md](references/execution-order.md#temporary-priority-work-and-return_to)
-for firing and validity rules.
+Before creating or changing work that may temporarily interrupt the current
+focus, read
+[temporary-interruptions.md](references/temporary-interruptions.md). It owns
+the temporary-versus-permanent decision, parentage, syntax, firing, and
+validity rules.
 
 ## Task Records, Artifacts, and Handoffs
 
@@ -99,7 +115,14 @@ in `task_tree/shared/`, never `/tmp` when a task artifact folder is available.
 Use `events.jsonl` in the task artifact folder for short factual,
 artifact-linked progress/resume pointers, not transcripts. Event timestamps
 and the detailed artifact contract are in
-[commands.md](references/commands.md#task-data-and-artifacts).
+[artifacts-and-events.md](references/artifacts-and-events.md).
+
+Destructive commands commit the tree before attempting managed artifact
+cleanup. If cleanup is interrupted or reports retained paths, use `scan-files`
+to inspect them and `scan-files --prune` to remove only canonical orphan task
+directories. The scanner reports but never automatically removes suspicious
+entries; see
+[destructive-operations.md](references/destructive-operations.md).
 
 Before compaction, restart, or handoff on nontrivial active work:
 
@@ -131,18 +154,21 @@ deferred.
 
 ## Git-Backed Work
 
-For a usable Git repository, when neither the user nor project rules prohibit
-commits, prefer small durable scoped commits over an accumulating working-tree
-diff. A task checkpoint and a Git checkpoint serve different purposes. Never
-stage or commit unrelated dirty files.
+Only when the user or project instructions have already authorized Git commits
+for the current workflow, prefer small durable scoped commits over an
+accumulating working-tree diff. Repository presence and silence about commits
+are not authorization. A task checkpoint and a Git checkpoint serve different
+purposes. Never stage or commit unrelated dirty files.
 
 Before multi-commit work, branch changes, or merging a task subtree, read
 [git-backed-work.md](references/git-backed-work.md).
 
 ## Command Reference
 
-Use these everyday operations; all other commands and their exact output modes
-are in [commands.md](references/commands.md).
+Use these everyday operations. For complete accepted syntax and output
+options, run `python .agents/skills/task-tree/scripts/task_tree.py --help` or
+append `--help` to a subcommand; do not load a prose catalog for ordinary CLI
+syntax.
 
 ```bash
 # Inspect, find the next task, and inspect one task.
@@ -157,11 +183,14 @@ python .agents/skills/task-tree/scripts/task_tree.py set-active 2
 ```
 
 `not_started` and `in_progress` are actionable; `completed`, `aborted`, and
-`impossible` are terminal. See the command reference for task mutation,
-reordering, querying, events, artifacts, deletion, and reset/clear semantics.
+`impossible` are terminal. Load the scenario references above only when their
+extra semantics are needed.
 
 ## Design Notes
 
 This implementation favors transparent, durable JSON storage, a CLI API,
-explicit artifact folders, filesystem locking with atomic writes, and
-lifecycle timestamps over a more sophisticated hidden system.
+explicit artifact folders, filesystem locking, and lifecycle timestamps over a
+more sophisticated hidden system. One tree JSON replacement is atomic for
+cooperating readers. A mutation that also removes directories is instead
+tree-first, crash-consistent, and recoverable through orphan scanning; it is
+not one cross-resource atomic transaction.

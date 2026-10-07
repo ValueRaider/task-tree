@@ -639,7 +639,7 @@ class TaskTreeApp(App[None]):
         self._reload_tree()
 
     def _read_data(self) -> Dict[str, Any]:
-        # The store owns schema validation, legacy handling, and lock behavior.
+        # The store owns schema validation and lock behavior.
         with self.store.locked_data() as data:
             return copy.deepcopy(data)
 

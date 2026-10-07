@@ -44,7 +44,7 @@ def assert_relationships_are_parent_owned(data):
     assert all("sibling_order" not in item for item in data["nodes"])
 
 
-def test_add_appends_to_parent_owned_list_without_legacy_fields(tmp_path: Path):
+def test_add_appends_to_parent_owned_list_without_child_owned_fields(tmp_path: Path):
     tree = copy_fixture(tmp_path)
 
     result = run_tree(tree, "add", "New child", "--parent", "1")
@@ -153,7 +153,7 @@ def test_force_delete_removes_complete_subtree_and_membership(tmp_path: Path):
     assert_relationships_are_parent_owned(data)
 
 
-def test_reset_writes_empty_valid_v2_store(tmp_path: Path):
+def test_reset_writes_empty_valid_current_store(tmp_path: Path):
     tree = copy_fixture(tmp_path)
 
     result = run_tree(tree, "reset")

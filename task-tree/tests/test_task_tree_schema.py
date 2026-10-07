@@ -1,5 +1,4 @@
 import copy
-import json
 import sys
 from pathlib import Path
 
@@ -9,11 +8,9 @@ import pytest
 TEST_DIR = Path(__file__).resolve().parent
 SKILL_DIR = TEST_DIR.parent
 SCRIPTS_DIR = SKILL_DIR / "scripts"
-FIXTURE = TEST_DIR / "fixtures" / "v1_migration_example" / "legacy-tree.json"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 from task_tree_schema import (
-    TaskTreeMigrationRequired,
     TaskTreeSchemaError,
     initialize_missing_schema_version,
     validate_tree,
@@ -48,8 +45,14 @@ def current_tree():
     }
 
 
-def legacy_tree():
-    return json.loads(FIXTURE.read_text(encoding="utf-8"))
+def child_owned_relationship_tree():
+    data = current_tree()
+    data["root_ids"] = [1]
+    for item in data["nodes"]:
+        item.pop("children")
+        item["parent_id"] = None if item["id"] == 1 else 1
+        item["sibling_order"] = item["id"]
+    return data
 
 
 def test_accepts_current_and_empty_current_trees():
@@ -83,7 +86,7 @@ def test_initializes_missing_version_only_for_populated_current_shape():
             "root_ids": [],
             "nodes": [],
         },
-        legacy_tree(),
+        child_owned_relationship_tree(),
         {
             "next_id": 2,
             "active_id": 1,
@@ -97,7 +100,7 @@ def test_initializes_missing_version_only_for_populated_current_shape():
         },
     ],
 )
-def test_does_not_initialize_empty_legacy_or_mixed_relationship_shapes(data):
+def test_does_not_initialize_empty_or_unsupported_relationship_shapes(data):
     data.pop("schema_version", None)
 
     assert initialize_missing_schema_version(data) is False
@@ -105,24 +108,33 @@ def test_does_not_initialize_empty_legacy_or_mixed_relationship_shapes(data):
 
 
 @pytest.mark.parametrize(
-    "data",
+    ("data", "message"),
     [
-        legacy_tree(),
-        {
-            "next_id": 1,
-            "active_id": None,
-            "nodes": [],
-        },
-        {
-            "schema_version": 1,
-            "next_id": 1,
-            "active_id": None,
-            "nodes": [],
-        },
+        (
+            child_owned_relationship_tree(),
+            "unsupported or incomplete relationship structure",
+        ),
+        (
+            {
+                "next_id": 1,
+                "active_id": None,
+                "nodes": [],
+            },
+            "missing required schema_version",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "next_id": 1,
+                "active_id": None,
+                "nodes": [],
+            },
+            "unsupported schema_version",
+        ),
     ],
 )
-def test_recognizable_legacy_input_requires_manual_migration(data):
-    with pytest.raises(TaskTreeMigrationRequired, match="manual migration utility"):
+def test_rejects_unsupported_or_incomplete_relationship_shapes(data, message):
+    with pytest.raises(TaskTreeSchemaError, match=message):
         validate_tree(data)
 
 
@@ -132,15 +144,15 @@ def test_recognizable_legacy_input_requires_manual_migration(data):
         (lambda data: data.pop("schema_version"), "missing required schema_version"),
         (
             lambda data: data.update(schema_version=1),
-            "current relationship structure conflicts",
+            "unsupported schema_version",
         ),
         (
             lambda data: data["nodes"][0].update(parent_id=None),
-            "mixed or incomplete relationship structure",
+            "unsupported or incomplete relationship structure",
         ),
         (
             lambda data: data["nodes"][0].pop("children"),
-            "mixed or incomplete relationship structure",
+            "unsupported or incomplete relationship structure",
         ),
         (lambda data: data.update(root_ids="1"), "root_ids must be a list"),
     ],

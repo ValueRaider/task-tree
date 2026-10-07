@@ -10,7 +10,6 @@ TEST_DIR = Path(__file__).resolve().parent
 SKILL_DIR = TEST_DIR.parent
 SCRIPTS_DIR = SKILL_DIR / "scripts"
 RUNTIME_MODULES = ("task_tree.py", "task_tree_schema.py", "json_format.py")
-LEGACY_FIXTURE = TEST_DIR / "fixtures" / "v1_migration_example" / "legacy-tree.json"
 
 
 def deploy_runtime(tmp_path: Path) -> tuple[Path, Path]:
@@ -97,6 +96,63 @@ def test_three_module_bundle_supports_help_create_read_and_mutate(tmp_path):
     assert delete_help.returncode == 0, delete_help.stderr
     assert "--prune-files" not in delete_help.stdout
     assert (
+        "Metadata and directory cleanup are crash-consistent and recoverable, "
+        "not one atomic transaction."
+        in " ".join(delete_help.stdout.split())
+    )
+    assert "scan-files --prune" in delete_help.stdout
+
+    prune_help = run_runtime(project, script, "prune-files", "--help")
+    assert prune_help.returncode == 0, prune_help.stderr
+    assert "Commit files_dir detachment before best-effort cleanup" in " ".join(
+        prune_help.stdout.split()
+    )
+    assert "scan-files --prune" in prune_help.stdout
+
+    scan_help = run_runtime(project, script, "scan-files", "--help")
+    assert scan_help.returncode == 0, scan_help.stderr
+    normalized_scan_help = " ".join(scan_help.stdout.split())
+    assert "Only --prune removes orphaned canonical positive-ID directories." in normalized_scan_help
+    assert "Suspicious entries" in normalized_scan_help
+
+    clear_help = run_runtime(project, script, "clear", "--help")
+    reset_help = run_runtime(project, script, "reset", "--help")
+    assert clear_help.returncode == 0, clear_help.stderr
+    assert reset_help.returncode == 0, reset_help.stderr
+    assert "Only canonical task directories are removed" in " ".join(
+        clear_help.stdout.split()
+    )
+    assert "Suspicious entries are reported and retained" in " ".join(
+        reset_help.stdout.split()
+    )
+
+    ensure_help = run_runtime(project, script, "ensure-files", "--help")
+    assert ensure_help.returncode == 0, ensure_help.stderr
+    assert "refuse to adopt a pre-existing path" in " ".join(
+        ensure_help.stdout.split()
+    )
+
+    query_help = run_runtime(project, script, "query", "--help")
+    assert query_help.returncode == 0, query_help.stderr
+    assert "files_detached_at" in query_help.stdout
+    assert "files_pruned_at" not in query_help.stdout
+    detached_query = run_runtime(
+        project,
+        script,
+        "query",
+        "--event",
+        "files_detached_at",
+    )
+    old_pruned_query = run_runtime(
+        project,
+        script,
+        "query",
+        "--event",
+        "files_pruned_at",
+    )
+    assert detached_query.returncode == 0, detached_query.stderr
+    assert old_pruned_query.returncode == 2
+    assert (
         "If no command is specified, show the compact active-task snapshot."
         in " ".join(help_result.stdout.split())
     )
@@ -117,7 +173,7 @@ def test_three_module_bundle_supports_help_create_read_and_mutate(tmp_path):
     assert add_result.returncode == 0, add_result.stderr
     canonical = project / "task_tree" / "tree.json"
     assert canonical.exists()
-    assert not (project / "task_tree" / "tree-v2.json").exists()
+    assert not (project / "task_tree" / "tree-versioned.json").exists()
 
     active_result = run_runtime(project, script, "active")
     assert active_result.returncode == 0, active_result.stderr
@@ -137,9 +193,9 @@ def test_three_module_bundle_supports_help_create_read_and_mutate(tmp_path):
     assert json.loads(canonical.read_text(encoding="utf-8"))["nodes"][0]["summary"] == "Renamed"
 
 
-def test_default_runtime_ignores_version_suffixed_sentinel(tmp_path):
+def test_default_runtime_uses_only_the_canonical_filename(tmp_path):
     project, script = deploy_runtime(tmp_path)
-    sentinel = project / "task_tree" / "tree-v2.json"
+    sentinel = project / "task_tree" / "tree-versioned.json"
     sentinel_bytes = b'"not the canonical store"\n'
     sentinel.parent.mkdir(parents=True)
     sentinel.write_bytes(sentinel_bytes)
@@ -151,7 +207,7 @@ def test_default_runtime_ignores_version_suffixed_sentinel(tmp_path):
     assert sentinel.read_bytes() == sentinel_bytes
 
 
-def test_legacy_environment_store_selection_warns_and_does_not_add_version_suffix(tmp_path):
+def test_deprecated_environment_store_selection_warns_and_uses_canonical_suffix(tmp_path):
     project, script = deploy_runtime(tmp_path)
 
     agent_result = run_runtime(
@@ -163,7 +219,7 @@ def test_legacy_environment_store_selection_warns_and_does_not_add_version_suffi
     )
     assert agent_result.returncode == 0, agent_result.stderr
     assert (project / "task_tree" / "review-agent.json").exists()
-    assert not (project / "task_tree" / "review-agent-v2.json").exists()
+    assert not (project / "task_tree" / "review-agent-versioned.json").exists()
     assert "TASK_TREE_AGENT is deprecated" in agent_result.stderr
     assert "--tree-file ./task_tree/review-agent.json" in agent_result.stderr
 
@@ -236,23 +292,26 @@ def test_cli_tree_file_parent_owns_tree_artifacts(tmp_path):
     assert Path(f"{cli_store}.lock").exists()
 
 
-def test_legacy_read_requires_manual_migration_without_rewriting(tmp_path):
+def test_runtime_rejects_unsupported_relationship_fields_without_rewriting(tmp_path):
     project, script = deploy_runtime(tmp_path)
-    legacy = project / "legacy.json"
-    legacy.write_bytes(LEGACY_FIXTURE.read_bytes())
-    before = legacy.read_bytes()
+    path = project / "unsupported.json"
+    data = tree()
+    data["nodes"][0].pop("children")
+    data["nodes"][0]["parent_id"] = None
+    data["nodes"][0]["sibling_order"] = 1
+    write_json(path, data)
+    before = path.read_bytes()
 
     result = run_runtime(
         project,
         script,
         "show",
-        env_updates={"TASK_TREE_FILE": str(legacy)},
+        env_updates={"TASK_TREE_FILE": str(path)},
     )
 
     assert result.returncode == 2
-    assert "old task-tree format detected" in result.stderr
-    assert "manual migration utility" in result.stderr
-    assert legacy.read_bytes() == before
+    assert "unsupported or incomplete relationship structure" in result.stderr
+    assert path.read_bytes() == before
 
 
 def test_read_initializes_and_persists_missing_version_on_populated_current_tree(

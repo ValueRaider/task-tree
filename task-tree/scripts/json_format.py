@@ -1,4 +1,4 @@
-"""Deterministic JSON formatting for experimental task-tree schema v2."""
+"""Deterministic JSON formatting for the current task-tree schema."""
 
 import json
 import re
@@ -83,8 +83,8 @@ def _compact_relationship_arrays(serialized: str, *, width: int) -> str:
     return "\n".join(output)
 
 
-def dumps_v2_json(data: Dict, *, width: int = RELATIONSHIP_ARRAY_LINE_WIDTH) -> str:
-    """Serialize v2 data while using horizontal space for relationship IDs."""
+def dumps_tree_json(data: Dict, *, width: int = RELATIONSHIP_ARRAY_LINE_WIDTH) -> str:
+    """Serialize task-tree data while using horizontal space for relationship IDs."""
 
     serialized = json.dumps(data, indent=2, sort_keys=True)
     return _compact_relationship_arrays(serialized, width=width) + "\n"

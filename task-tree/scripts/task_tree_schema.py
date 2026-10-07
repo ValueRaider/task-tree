@@ -18,10 +18,6 @@ class TaskTreeSchemaError(ValueError):
     """Raised when persisted task-tree data violates the current contract."""
 
 
-class TaskTreeMigrationRequired(TaskTreeSchemaError):
-    """Raised when input is recognizably legacy and needs manual migration."""
-
-
 def _require_int(value: object, label: str, *, positive: bool = False) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise TaskTreeSchemaError(f"{label} must be an integer")
@@ -33,26 +29,13 @@ def _require_int(value: object, label: str, *, positive: bool = False) -> int:
 def _require_current_version(data: Dict) -> None:
     if "schema_version" not in data:
         raise TaskTreeSchemaError(
-            "current-format task tree is missing required schema_version 2"
+            "task tree is missing required schema_version 2"
         )
     version = data["schema_version"]
     if version != CURRENT_SCHEMA_VERSION:
         raise TaskTreeSchemaError(
-            "current relationship structure conflicts with "
-            f"schema_version {version!r}; expected 2"
+            f"unsupported schema_version {version!r}; expected 2"
         )
-
-
-def _raise_legacy_or_version_error(data: Dict) -> None:
-    version = data.get("schema_version")
-    if version not in (None, 1):
-        raise TaskTreeSchemaError(
-            "legacy relationship structure conflicts with "
-            f"schema_version {version!r}; expected 1 or no version"
-        )
-    raise TaskTreeMigrationRequired(
-        "old task-tree format detected; run the manual migration utility before using it"
-    )
 
 
 def initialize_missing_schema_version(data: object) -> bool:
@@ -60,7 +43,7 @@ def initialize_missing_schema_version(data: object) -> bool:
 
     The relationship representation supplies enough evidence for this narrow
     metadata repair: roots have one top-level owner, every populated node has a
-    parent-owned ``children`` list, and no legacy child-owned fields remain.
+    parent-owned ``children`` list, and no unsupported child-owned fields remain.
     Empty or mixed input is deliberately left untouched because its format cannot
     be inferred from actual relationships.
     """
@@ -84,9 +67,8 @@ def initialize_missing_schema_version(data: object) -> bool:
 def _recognize_current_format(data: object) -> Dict:
     """Return current-format input or raise a precise format diagnostic.
 
-    Relationship fields are inspected before defaults are applied because adding
-    ``children`` during loading would make legacy input look current and could let
-    an ordinary runtime command rewrite it without the required manual migration.
+    Relationship fields are inspected without adding defaults so an unsupported
+    structure cannot be rewritten by an ordinary runtime command.
     """
 
     if not isinstance(data, dict):
@@ -98,48 +80,31 @@ def _recognize_current_format(data: object) -> Dict:
     if any(not isinstance(node, dict) for node in nodes):
         raise TaskTreeSchemaError("every node must be an object")
 
+    _require_current_version(data)
+
     has_root_ids = "root_ids" in data
-    if has_root_ids and not isinstance(data["root_ids"], list):
+    if not has_root_ids:
+        raise TaskTreeSchemaError("task tree is missing required root_ids")
+    if not isinstance(data["root_ids"], list):
         raise TaskTreeSchemaError("root_ids must be a list")
 
     if not nodes:
-        if has_root_ids:
-            _require_current_version(data)
-            return data
-        if data.get("schema_version") in (None, 1):
-            _raise_legacy_or_version_error(data)
-        raise TaskTreeSchemaError(
-            "schema_version 2 task tree is missing required root_ids"
-        )
-
-    current_nodes = ["children" in node for node in nodes]
-    legacy_order_nodes = ["sibling_order" in node for node in nodes]
-    legacy_parent_nodes = ["parent_id" in node for node in nodes]
-    has_any_legacy_field = any(legacy_order_nodes) or any(legacy_parent_nodes)
-
-    if all(current_nodes) and not has_any_legacy_field:
-        if not has_root_ids:
-            raise TaskTreeSchemaError(
-                "current relationship structure is missing required root_ids"
-            )
-        _require_current_version(data)
         return data
 
-    if (
-        all(legacy_order_nodes)
-        and all(legacy_parent_nodes)
-        and not any(current_nodes)
-        and not has_root_ids
-    ):
-        _raise_legacy_or_version_error(data)
+    current_nodes = ["children" in node for node in nodes]
+    unsupported_order_nodes = ["sibling_order" in node for node in nodes]
+    unsupported_parent_nodes = ["parent_id" in node for node in nodes]
+    has_unsupported_field = any(unsupported_order_nodes) or any(unsupported_parent_nodes)
 
-    # Partial or mixed relationship fields have no unambiguous owner of order.
-    # Refusing them is safer than guessing from node IDs or whichever field happens
-    # to be present first.
+    if all(current_nodes) and not has_unsupported_field:
+        return data
+
+    # Partial, mixed, and child-owned relationship fields have no accepted owner
+    # of order. Refusing them is safer than guessing from node IDs or whichever
+    # field happens to be present first.
     raise TaskTreeSchemaError(
-        "mixed or incomplete relationship structure: current nodes require "
-        "children with top-level root_ids; legacy nodes require parent_id and "
-        "sibling_order without those current fields"
+        "unsupported or incomplete relationship structure: every node requires "
+        "children owned by the parent; parent_id and sibling_order are not accepted"
     )
 
 

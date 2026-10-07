@@ -1,8 +1,9 @@
 # Git-Backed Task Work
 
 Use Git to preserve coherent work without confusing a durable checkpoint with
-task completion. These rules apply only when the project is a usable Git
-repository and neither the user nor project instructions prohibit commits.
+task completion. These rules apply only after the user or project instructions
+authorize Git commits for the current workflow. A usable repository and silence
+about commits do not supply that authorization.
 
 ## Choose the Boundary
 

@@ -50,6 +50,19 @@ after this task becomes terminal and its subtree has no actionable work. It may
 refer to an ancestor or another branch, including a terminal task, but not the
 same task or one of its descendants.
 
+`files_dir` is either null or a string naming the task's artifact directory.
+The schema validates its type; filesystem ownership is a stricter CLI safety
+policy. Automatic creation and recursive cleanup accept only the selected
+store's canonical `files/<task-id>` path, allowing equivalent relative or
+absolute spellings. Noncanonical edited values can be logically detached or
+deleted with their task record, but task-tree reports and retains the named
+filesystem path. A null `files_dir` does not prove the canonical path is absent:
+an interrupted cleanup may leave an orphan for `scan-files` to report.
+
+`events` is a lifecycle-timestamp object. Artifact attachment records
+`files_created_at`; logical detachment records `files_detached_at` at the tree
+commit and deliberately makes no claim that later directory cleanup succeeded.
+
 ## Required invariants
 
 1. `schema_version` is exactly `2`.
@@ -71,19 +84,20 @@ recovery exception: its read may skip only active-pointer validation, then it
 sets the pointer to null and performs full validation before writing. It cannot
 rewrite a structurally invalid graph.
 
+Tree writes flush the temporary JSON, atomically replace the selected file,
+and synchronize its parent directory while holding the store lock. Removing
+the tree with `--drop-file` also synchronizes the parent directory. That commit
+does not include artifact directories. Destructive commands commit tree
+metadata first, retain the exclusive lock through best-effort directory
+cleanup, and may leave only unreferenced residue for later orphan pruning.
+
 If an existing **populated** tree lacks `schema_version` but has an unambiguous
 current relationship shape—top-level `root_ids`, `children` on every node, and
-no legacy relationship fields—the runtime initializes and persists
-`schema_version: 2`. It validates the complete tree before that metadata-only
-write. Empty, legacy, mixed, ambiguous, or otherwise invalid input is never
-inferred or rewritten by this rule.
+no unsupported child-owned relationship fields—the runtime initializes and
+persists `schema_version: 2`. It validates the complete tree before that
+metadata-only write. Empty, mixed, ambiguous, or otherwise invalid input is
+never inferred or rewritten by this rule.
 
-## Legacy recognition
-
-The old format stored `parent_id` and `sibling_order` on each task and had no
-parent-owned `children` or top-level `root_ids`. The runtime recognizes a
-consistent old shape so it can give a manual-migration diagnostic, but it never
-converts, fills, or rewrites that input. Mixed, partial, conflicting, and
-unknown-version structures are rejected rather than guessed from task IDs.
-
-For the explicit conversion procedure, see [migration.md](migration.md).
+Unsupported child-owned relationship fields, partial structures, conflicting
+ownership, and unknown schema versions are rejected rather than guessed from
+task IDs.

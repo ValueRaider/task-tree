@@ -15,7 +15,7 @@
       "files_dir": null,
       "id": 1,
       "status": "in_progress",
-      "summary": "Primary migration root"
+      "summary": "Primary root"
     },
     {
       "body": "Second root used to verify explicit root ordering.",
@@ -59,7 +59,7 @@
         "last_mutated_at": "2026-09-19T19:49:00Z",
         "status_changed_at": "2026-09-19T19:48:59Z"
       },
-      "files_dir": "task_tree/files/664/migration-example/files/4",
+      "files_dir": "task_tree/files/current-example/files/4",
       "id": 4,
       "status": "in_progress",
       "summary": "Active middle child"

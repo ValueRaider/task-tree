@@ -10,8 +10,6 @@ TEST_DIR = Path(__file__).resolve().parent
 SKILL_DIR = TEST_DIR.parent
 TASK_TREE = SKILL_DIR / "scripts" / "task_tree.py"
 CURRENT_FIXTURE = TEST_DIR / "fixtures" / "current_task_tree_example" / "tree.json"
-BASELINE_DIR = TEST_DIR / "fixtures" / "v1_migration_example"
-LEGACY_FIXTURE = BASELINE_DIR / "legacy-tree.json"
 
 
 def copy_fixture(tmp_path: Path) -> Path:
@@ -32,26 +30,36 @@ def run_tree(tree: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_full_tree_render_matches_pre_migration_baseline(tmp_path: Path):
+def test_full_tree_render_preserves_parent_owned_order(tmp_path: Path):
     tree = copy_fixture(tmp_path)
 
     result = run_tree(tree, "show")
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == (BASELINE_DIR / "expected-full-tree.txt").read_text(
-        encoding="utf-8"
-    )
+    assert result.stdout.splitlines() == [
+        "[ ] #2 Secondary root",
+        "[~] #1 Primary root",
+        "  [x] #3 Completed setup",
+        "  [ ] #5 Later pending child",
+        "  [~] #4 Active middle child << ACTIVE",
+        "    [ ] #6 Nested pending child",
+        "  [x] #7 Completed branch",
+        "    [x] #8 Completed grandchild",
+        "  [!] #9 Impossible sibling",
+    ]
 
 
-def test_path_matches_pre_migration_baseline(tmp_path: Path):
+def test_path_uses_parent_owned_ancestry(tmp_path: Path):
     tree = copy_fixture(tmp_path)
 
     result = run_tree(tree, "path", "6")
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == (BASELINE_DIR / "expected-path-to-6.txt").read_text(
-        encoding="utf-8"
-    )
+    assert result.stdout.splitlines() == [
+        "#1 Primary root [in_progress]",
+        "#4 Active middle child [in_progress]",
+        "#6 Nested pending child [not_started]",
+    ]
 
 
 def test_next_preserves_active_descendant_priority(tmp_path: Path):
@@ -74,17 +82,3 @@ def test_children_json_derives_compatibility_relationship_fields(tmp_path: Path)
     assert [node["id"] for node in payload["nodes"]] == [3, 5, 4, 7, 9]
     assert [node["sibling_order"] for node in payload["nodes"]] == [1, 2, 3, 4, 5]
     assert all(node["parent_id"] == 1 for node in payload["nodes"])
-
-
-def test_runtime_rejects_unmigrated_legacy_tree(tmp_path: Path):
-    legacy_copy = tmp_path / "legacy-tree.json"
-    legacy_copy.write_text(
-        LEGACY_FIXTURE.read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-
-    result = run_tree(legacy_copy, "show")
-
-    assert result.returncode == 2
-    assert "old task-tree format detected" in result.stderr
-    assert "manual migration utility" in result.stderr

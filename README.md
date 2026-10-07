@@ -1,7 +1,7 @@
 # task-tree
 
 A durable adaptive task-tree for keeping Codex work structured across long, multi-session projects. 
-Switch workstreams, reorder priorities, and resume (in a new session) with durable context.
+Switch workstreams, reorder priorities, and resume with durable context.
 
 Self-contained skill - just copy `task-tree` into your skills folder.
 
@@ -66,11 +66,8 @@ Loading `task-tree` skill automatically loads the active task.
 python .agents/skills/task-tree/scripts/task_tree.py tui
 ```
 
-Navigate with the mouse or arrow keys. 
-
-Move a task by (i) selecting it and pressing `m` or (ii) click-and-drag it. 
-Then go to target location: click/drop left-half ot task text to insert after it, 
-or right-half to add as a child. Press `u` to undo move.
-
+Navigate with the mouse or arrow keys. Press `m` to move the selected task and `u` to undo. 
+Click-and-drag task to relocate: drop on the left half of a task text to insert after it, 
+or the right half to add as a child."
 See the [command reference](task-tree/references/commands.md) for
 the full controls.
