@@ -18,6 +18,7 @@ from typing import Dict, Iterator, List, Optional
 
 sys.path.insert(0, os.path.dirname(__file__))
 from json_format import dumps_tree_json
+import task_tree_notepad as notepad_storage
 from task_tree_schema import (
     ACTIONABLE_STATUSES,
     VALID_STATUSES,
@@ -983,7 +984,10 @@ def node_path(data: Dict, node_id: int) -> List[Dict]:
     return path
 
 
-def render_node_details(store: TaskTreeStore, node: Dict, data: Optional[Dict] = None) -> str:
+def render_node_details(
+    store: TaskTreeStore, node: Dict, data: Optional[Dict] = None,
+    *, include_notepad: bool = True,
+) -> str:
     parent_id = parent_id_for(data, node["id"]) if data is not None else None
     parent_text = "None"
     if parent_id is not None:
@@ -1054,6 +1058,8 @@ def render_node_details(store: TaskTreeStore, node: Dict, data: Optional[Dict] =
         for key in sorted(events):
             lines.append(f"  {key}: {events[key]}")
     lines.append(f"shared_dir: {shared_dir_for_store(store)}")
+    if include_notepad and data is not None and node["id"] == data.get("active_id"):
+        lines.extend(("", notepad_storage.render(notepad_storage.snapshot(store.path))))
     return "\n".join(lines)
 
 
@@ -1116,7 +1122,7 @@ def next_after_subtree(data: Dict, subtree_root: Optional[Dict]) -> Optional[Dic
 
 def render_status_snapshot(store: TaskTreeStore, data: Dict) -> str:
     active_id = data["active_id"]
-    lines = ["task_tree_snapshot:"]
+    lines = ["task_tree_snapshot:", notepad_storage.render(notepad_storage.snapshot(store.path)), ""]
     if active_id is None:
         lines.append("active: (no active task)")
         lines.append(f"next_actionable: {render_node_brief(choose_next_task(data), active_id)}")
@@ -1133,7 +1139,7 @@ def render_status_snapshot(store: TaskTreeStore, data: Dict) -> str:
         lines.append(f"parent: {render_node_title(parent)}")
     if previous_node is not None:
         lines.append(f"previous_sibling: {render_node_title(previous_node)}")
-    lines.extend(["active:", indent_text(render_node_details(store, active, data), "  ")])
+    lines.extend(["active:", indent_text(render_node_details(store, active, data, include_notepad=False), "  ")])
     if next_node is not None:
         lines.append(f"next_sibling: {render_node_title(next_node)}")
     if following_branch is not None:
@@ -1162,6 +1168,7 @@ def status_snapshot_to_dict(store: TaskTreeStore, data: Dict) -> Dict:
         "next_after_subtree": None,
         "next_actionable": None,
         "shared_dir": shared_dir_for_store(store),
+        "notepad": notepad_storage.snapshot(store.path),
     }
     if active_id is None:
         payload["next_actionable"] = snapshot_context_reference(choose_next_task(data))
@@ -1172,9 +1179,8 @@ def status_snapshot_to_dict(store: TaskTreeStore, data: Dict) -> Dict:
     parent = parent_node(data, active["id"])
     payload.update(
         {
-            # Preserve the former active --json record inside the richer
-            # snapshot payload so the API expansion changes only its enclosing path.
-            "active": node_to_dict(store, active, active_id, data),
+            # The snapshot already carries the note at the top level.
+            "active": node_to_dict(store, active, active_id, data, include_notepad=False),
             "parent": snapshot_context_reference(parent),
             "previous_sibling": snapshot_context_reference(previous_node),
             "next_sibling": snapshot_context_reference(next_node),
@@ -1193,12 +1199,13 @@ def render_mutation_result(store: TaskTreeStore, data: Dict, *, full_tree: bool)
 
 
 def node_to_dict(
-    store: TaskTreeStore, node: Dict, active_id: Optional[int], data: Dict
+    store: TaskTreeStore, node: Dict, active_id: Optional[int], data: Dict,
+    *, include_notepad: bool = True,
 ) -> Dict:
-    # The JSON view derives relationship metadata for callers; the store never
-    # persists these compatibility fields on the child record.
+    # Relationship metadata and active-task context are output only, never
+    # persisted on the child record.
     siblings = sibling_nodes(data, node["id"])
-    return {
+    payload = {
         "id": node["id"],
         "sibling_order": next(
             index for index, sibling in enumerate(siblings, start=1) if sibling["id"] == node["id"]
@@ -1214,6 +1221,9 @@ def node_to_dict(
         "is_active": node["id"] == active_id,
         "events": ensure_node_events(node),
     }
+    if include_notepad and node["id"] == active_id:
+        payload["notepad"] = notepad_storage.snapshot(store.path)
+    return payload
 
 
 def list_candidates(data: Dict, status: Optional[str] = None) -> List[Dict]:
@@ -2285,6 +2295,41 @@ def cmd_scan_files(args: argparse.Namespace) -> int:
     return 1 if inventory["failed"] else 0
 
 
+def cmd_notepad(args: argparse.Namespace) -> int:
+    store = default_store(args.tree_file)
+    # Note replacement does not commit task metadata. The existing exclusive
+    # lock serializes it with both other note writers and shared cleanup.
+    if args.notepad_action == "show":
+        with store.locked_data():
+            payload = notepad_storage.snapshot(store.path)
+        print(json.dumps(payload, indent=2, ensure_ascii=False) if args.json else notepad_storage.render(payload))
+        return 2 if payload["status"] == "error" else 0
+    try:
+        text = None
+        if args.notepad_action == "replace":
+            if args.text is not None:
+                text = args.text
+            else:
+                with open(args.from_file, "rb") as source:
+                    raw = source.read(notepad_storage.MAX_TEXT_BYTES + 1)
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise ValueError("notepad input must be UTF-8") from error
+            notepad_storage.validate_text(text)
+        with store.locked_transaction():
+            if args.notepad_action == "clear":
+                notepad_storage.clear(store.path)
+            else:
+                notepad_storage.replace(store.path, text)
+            payload = notepad_storage.snapshot(store.path)
+            output = json.dumps(payload, indent=2, ensure_ascii=False) if args.json else notepad_storage.render(payload)
+    except OSError as error:
+        raise ValueError(f"cannot update notepad: {error}") from error
+    print(output)
+    return 0
+
+
 def cmd_shared_dir(args: argparse.Namespace) -> int:
     store = default_store(args.tree_file)
     print(ensure_dir(shared_dir_for_store(store)))
@@ -2462,6 +2507,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snapshot.add_argument("--json", action="store_true", help="Emit the complete snapshot context as JSON rather than text.")
     snapshot.set_defaults(func=cmd_snapshot)
+
+    notepad = add_command("notepad", "notepad {show,replace,clear}", help="Read or maintain bounded tree-wide context")
+    note_commands = notepad.add_subparsers(dest="notepad_action", required=True)
+    note_show = note_commands.add_parser("show", help="Read the notepad without modifying it")
+    note_replace = note_commands.add_parser("replace", help="Atomically replace the managed notepad; at most 200 words / 8192 UTF-8 bytes")
+    note_input = note_replace.add_mutually_exclusive_group(required=True)
+    note_input.add_argument("--text", help="Complete replacement text")
+    note_input.add_argument("--from-file", metavar="PATH", help="Read bounded UTF-8 replacement text from a file")
+    note_clear = note_commands.add_parser("clear", help="Remove only a valid owned notepad; refuse collisions")
+    for note_command in (note_show, note_replace, note_clear):
+        note_command.add_argument("--json", action="store_true", help="Emit the structured notepad status")
+        note_command.set_defaults(func=cmd_notepad)
 
     tui = add_command(
         "tui",

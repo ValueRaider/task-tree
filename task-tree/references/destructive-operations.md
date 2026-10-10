@@ -58,7 +58,9 @@ pruning records a failure; suspicious entries alone are an inspection result.
 - `reset` commits an empty tree and always requests cleanup of canonical task
   directories.
 - `clear` cleans task or shared artifacts only with `--prune-files` or
-  `--prune-shared`; otherwise those artifacts intentionally remain.
+  `--prune-shared`; otherwise those artifacts intentionally remain. This includes
+  the tree-wide notepad: pruning shared removes all notes for trees sharing that
+  parent directory; ordinary reset/drop/clear preserves them.
 - `--drop-file` durably removes the tree JSON instead of writing an empty
   tree. Unsafe shared roots and suspicious task-root entries are retained.
 

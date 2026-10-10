@@ -58,3 +58,74 @@ append-only progress-event log.
 
 `files_detached_at` records the metadata commit that cleared `files_dir`; it
 does not assert that physical directory cleanup completed.
+
+## Tree-wide notepad
+
+The notepad is bounded shared context displayed in every compact text/JSON
+snapshot and beneath task details in the TUI. CLI detail output for the active
+task also includes it automatically: `show <active-id> --details` / `--json`,
+`active` / `active --json`, detailed mutation output and `next` when it prints
+the active task. Other commands using the same detail renderers include it
+when their full detail output contains the active task. Text details append a labelled note;
+JSON task records add a `notepad` field. Snapshots retain their single top-level
+note, without duplicating it inside the active record. Inactive task details
+and title-only or compact summary views do not acquire notes.
+
+Prefer the notepad for cross-task preferences unless a clear alternative home
+is known. Keep the preference in that home rather than duplicating it, with a
+notepad pointer when useful. Navigation facts and caveats also belong here.
+This context is not persisted task metadata, a second plan, execution permission
+or an acceptance gate; task-specific permissions and safety constraints remain
+in their owning tasks. Missing notes are explicit; invalid or unreadable notes
+are shown as unavailable without hiding valid task data.
+
+```bash
+python .agents/skills/task-tree/scripts/task_tree.py notepad show
+python .agents/skills/task-tree/scripts/task_tree.py notepad replace \
+  --text "Source lookup: task_tree/files/635/relocation-map.md"
+python .agents/skills/task-tree/scripts/task_tree.py notepad replace \
+  --from-file path/to/replacement.txt
+python .agents/skills/task-tree/scripts/task_tree.py notepad clear
+```
+
+Each operation supports `--json`; put `--tree-file PATH` before `notepad` to
+select another tree. Replacement is complete, not an append. The code enforces
+at most **200 whitespace-separated words and 8192 UTF-8 text bytes**, including
+bounded file reads. Oversized input is refused without replacing the note.
+Empty text is permitted; `clear` removes it. No automatic truncation.
+
+### Reserved storage and ownership
+
+The default tree reserves `shared/.task-tree-notepad.md`. Other tree filenames
+use `.task-tree-notepad-<SHA-256 of tree filename>.md` in their parent's shared
+directory, so different trees in the same directory have separate notes. The
+folder stays flat. `.task-tree-notepad`-prefixed filenames are reserved for the
+notepad facility; do not use them for ordinary artifacts. No generic
+`shared/notepad.md` is read or adopted.
+
+The storage API computes the canonical path and checks an exact managed header
+bound to the tree filename, current-user ownership, mode 0600, one hard link,
+regular-file type, UTF-8 and size limits. Unsafe paths, foreign/absent headers
+and malformed files are refused on read/replace/clear, not adopted or deleted.
+A copied file for another tree is a collision. Moving the entire tree directory
+keeps the filename binding valid; renaming the tree file selects a different
+note. Inspect a collision before requesting any manual cleanup.
+
+CLI writers share the tree's exclusive lock; readers use the shared lock.
+Replacement uses a private temporary file and atomic replacement. An error
+after replacement/during directory sync can mean the new note is already
+visible; inspect before deciding whether to retry. Note operations do not
+commit task JSON or modify unrelated shared artifacts. There is no schema change.
+This is executable validation of API-owned storage, **not filesystem access
+control** against arbitrary external writes or forged headers. `shared-dir`
+exposes the directory; it is not a generic artifact-file writer.
+
+### Lifetime
+
+Task completion, deletion, switching, reset and ordinary clear do not remove
+the notepad. As with other shared artifacts, explicit `clear/reset --prune-shared`
+removes the **entire shared directory**, including every note for trees sharing
+that parent. This existing broad-cleanup behavior is unchanged. Dropping the
+tree JSON without pruning shared artifacts preserves its note. `scan-files`
+does not manage shared notes. These operations still require their existing
+permissions; a note does not grant disposal authority.
