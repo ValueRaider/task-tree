@@ -67,7 +67,9 @@ python .agents/skills/task-tree/scripts/task_tree.py tui
 ```
 
 Navigate with the mouse or arrow keys. Press `m` to move the selected task and `u` to undo. 
+Press `/` to search as you type, `n` / `N` to navigate matches, and `s` to configure case
+sensitivity, body search, and ignored task states.
 Click-and-drag task to relocate: drop on the left half of a task text to insert after it, 
 or the right half to add as a child."
-See the [command reference](task-tree/references/commands.md) for
+See the [TUI reference](task-tree/references/tui.md) for
 the full controls.

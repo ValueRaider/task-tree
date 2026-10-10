@@ -23,6 +23,55 @@ it, then use Up/Down, PageUp/PageDown, Home, or End. Selecting another task
 resets the details to the top. On startup, the viewer reveals the branch to
 the active task and expands that task when it has children.
 
+## Text search
+
+Press `/` to open the search command bar. After 500 ms without further typing,
+deletion, or pasting, search automatically updates matches and previews a matching
+task while keeping focus in the input. Each edit restarts this delay, so rapid
+edits trigger only one search. Every preview searches at or after the task
+selected when `/` was opened, rather than advancing from the previous preview.
+If there are no matches or the query is empty, the cursor returns to that
+original task.
+
+Enter applies the current input immediately, without waiting for the delay, and
+returns to tree navigation. Escape cancels pending search and restores the
+previous search, selection, and branch expansion. Clearing the input removes
+match highlighting after the same delay; Enter clears it immediately. Opening
+`/` again selects the previous query for replacement or editing. Queries are
+plain, literal text, not regexes, and special characters are not treated as
+modifiers.
+
+Press `n` for the next matching task or `N` (Shift+N) for the previous one.
+Matches follow depth-first tree order and wrap around. Collapsed descendants
+are included, and jumping to one expands its ancestors. Matching task labels
+are emphasized; the status line reports the match position/count or no matches.
+Search navigates the existing tree rather than hiding tasks.
+
+Outside search input, press `s` to configure search. The bottom command bar
+replaces the normal controls with the current settings and these toggles:
+
+| Key | Setting |
+| --- | --- |
+| `c` | Toggle case-sensitive / case-insensitive matching |
+| `b` | Include task bodies as well as summaries |
+| `1` | Ignore `completed` tasks |
+| `2` | Ignore `aborted` tasks |
+| `3` | Ignore `impossible` tasks |
+| `4` | Ignore `not_started` tasks |
+| `5` | Ignore `in_progress` tasks |
+
+Each state toggle shows `on` when that state is ignored. Escape, Enter, or `s`
+returns to navigation, retaining settings and recomputing an existing search
+without jumping to another task. Normal navigation, move, reload, and quit keys
+do not run while configuring search; while entering a query, letters such as
+`s`, `q`, and `m` are ordinary text.
+
+Defaults are case-sensitive, summaries only, and no ignored states. Preferences
+last for the TUI session, including reloads; they do not change the stored tree.
+Ignored parents remain visible and do not exclude eligible descendants. Body
+search reads the stored body text, not artifact file contents. Finish or cancel
+an active move/drag before entering search or navigating search matches.
+
 ## Relocate a task
 
 Click and drag a task to move it. The valid durable task under the pointer is

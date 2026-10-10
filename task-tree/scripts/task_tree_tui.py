@@ -6,14 +6,16 @@ minimal installations. Relocations are committed through the store's normal
 locked mutation path rather than by editing the backing JSON directly.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import copy
 from typing import Any, Callable, Dict, Optional, Set
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Click, MouseDown, MouseMove, MouseUp
-from textual.widgets import Footer, Header, Static, Tree
+from textual.screen import ModalScreen
+from textual.timer import Timer
+from textual.widgets import Footer, Header, Input, Static, Tree
 from textual.widgets.tree import UnknownNodeID
 from rich.style import Style
 from rich.text import Text
@@ -28,6 +30,208 @@ STATUS_MARKERS = {
 }
 
 
+@dataclass
+class SearchSettings:
+    """Session-local search preferences; never written to the task store."""
+
+    case_sensitive: bool = True
+    include_body: bool = False
+    ignored_statuses: Set[str] = field(default_factory=set)
+
+
+@dataclass
+class SearchSnapshot:
+    """The view to restore if an incremental search is cancelled."""
+
+    query: str
+    selected_id: Optional[int]
+    expanded_ids: Set[int]
+    status: str
+
+
+def _task_ids_in_order(data: Dict[str, Any]) -> list[int]:
+    """Depth-first durable order, independent of the visible expansion state."""
+
+    by_id = _node_index(data)
+    ordered = []
+    pending = list(reversed(data.get("root_ids", [])))
+    while pending:
+        node_id = pending.pop()
+        ordered.append(node_id)
+        pending.extend(reversed(by_id[node_id]["children"]))
+    return ordered
+
+
+def _search_task_ids(
+    data: Dict[str, Any], query: str, settings: SearchSettings
+) -> list[int]:
+    """Match literal text in tree order, including collapsed descendants."""
+
+    if not query:
+        return []
+    needle = query if settings.case_sensitive else query.casefold()
+    by_id = _node_index(data)
+    matches = []
+    for node_id in _task_ids_in_order(data):
+        node = by_id[node_id]
+        # Ignoring a parent must not exclude otherwise eligible children.
+        if node["status"] in settings.ignored_statuses:
+            continue
+        fields = [node["summary"]]
+        if settings.include_body:
+            fields.append(node.get("body") or "")
+        if any(
+            needle in (value if settings.case_sensitive else value.casefold())
+            for value in fields
+        ):
+            matches.append(node_id)
+    return matches
+
+
+class SearchInputScreen(ModalScreen[Optional[str]]):
+    """A bottom command bar whose typed keys cannot reach normal bindings."""
+
+    DEFAULT_CSS = """
+    SearchInputScreen { align: left bottom; background: transparent; }
+    #search-command { height: auto; background: $surface; }
+    #search-input { height: 3; }
+    #search-input-hints { height: auto; padding: 0 1; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    PREVIEW_DELAY = 0.5
+
+    def __init__(self, query: str, preview: Callable[[str], None]) -> None:
+        super().__init__()
+        self._initial_query = query
+        self._last_input_value = query
+        self._preview = preview
+        self._preview_timer: Optional[Timer] = None
+        self._preview_generation = 0
+        self._finished = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="search-command"):
+            yield Input(
+                self._initial_query,
+                placeholder="/ Search (literal text)",
+                id="search-input",
+            )
+            yield Static(
+                "Search after 500 ms idle · Enter Apply now · Esc Cancel",
+                id="search-input-hints",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        event.stop()
+        # Input also emits Changed for its initial value, before any editing.
+        if not self._finished and event.value != self._last_input_value:
+            self._last_input_value = event.value
+            self._stop_pending_preview()
+            generation = self._preview_generation
+            self._preview_timer = self.set_timer(
+                self.PREVIEW_DELAY,
+                lambda: self._preview_if_current(generation, event.value),
+            )
+
+    def _stop_pending_preview(self) -> None:
+        self._preview_generation += 1
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+            self._preview_timer = None
+
+    def _preview_if_current(self, generation: int, query: str) -> None:
+        # A stopped timer may already have queued its callback. Ignore stale
+        # edits and callbacks from a screen that has been dismissed.
+        if not self._finished and generation == self._preview_generation:
+            self._preview_timer = None
+            self._preview(query)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._finished = True
+        self._stop_pending_preview()
+        # The app applies the submitted value synchronously on dismissal.
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        self._finished = True
+        self._stop_pending_preview()
+        self.dismiss(None)
+
+    def on_unmount(self) -> None:
+        self._finished = True
+        self._stop_pending_preview()
+
+
+class SearchConfigScreen(ModalScreen[None]):
+    """Immediate toggles in a modal command bar, not commands in the query."""
+
+    DEFAULT_CSS = """
+    SearchConfigScreen { align: left bottom; background: transparent; }
+    #search-config { height: auto; padding: 0 1; background: $surface; }
+    """
+    STATUS_KEYS = {
+        "1": "completed",
+        "2": "aborted",
+        "3": "impossible",
+        "4": "not_started",
+        "5": "in_progress",
+    }
+    BINDINGS = [
+        ("c", "toggle_case", "Case"),
+        ("b", "toggle_body", "Bodies"),
+        *[
+            (key, f"toggle_status('{status}')", status)
+            for key, status in STATUS_KEYS.items()
+        ],
+        ("escape,enter,s", "done", "Back"),
+    ]
+
+    def __init__(self, settings: SearchSettings) -> None:
+        super().__init__()
+        self.settings = settings
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._hints(), id="search-config")
+
+    def _hints(self) -> Text:
+        case = "sensitive" if self.settings.case_sensitive else "insensitive"
+        body = "on" if self.settings.include_body else "off"
+        ignores = [
+            f"{key} {status}: {'on' if status in self.settings.ignored_statuses else 'off'}"
+            for key, status in self.STATUS_KEYS.items()
+        ]
+        return Text(
+            f"Search settings · c Case: {case} · b Bodies: {body}\n"
+            f"Ignore: {' · '.join(ignores[:3])}\n"
+            f"        {' · '.join(ignores[3:])}\n"
+            "Esc / Enter / s Back (settings retained)"
+        )
+
+    def _refresh_hints(self) -> None:
+        self.query_one("#search-config", Static).update(self._hints())
+
+    def action_toggle_case(self) -> None:
+        self.settings.case_sensitive = not self.settings.case_sensitive
+        self._refresh_hints()
+
+    def action_toggle_body(self) -> None:
+        self.settings.include_body = not self.settings.include_body
+        self._refresh_hints()
+
+    def action_toggle_status(self, status: str) -> None:
+        if status in self.settings.ignored_statuses:
+            self.settings.ignored_statuses.remove(status)
+        else:
+            self.settings.ignored_statuses.add(status)
+        self._refresh_hints()
+
+    def action_done(self) -> None:
+        self.dismiss()
+
+
 def _node_index(data: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
     return {node["id"]: node for node in data["nodes"]}
 
@@ -35,6 +239,15 @@ def _node_index(data: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
 def _node_label(node: Dict[str, Any], active_id: Optional[int]) -> str:
     marker = "  ← active" if node["id"] == active_id else ""
     return f"{STATUS_MARKERS[node['status']]} #{node['id']} {node['summary']}{marker}"
+
+
+def _styled_node_label(
+    node: Dict[str, Any], active_id: Optional[int], *, matched: bool
+) -> Text:
+    label = Text(_node_label(node, active_id))
+    if matched:
+        label.stylize("bold yellow")
+    return label
 
 
 def _detail_text(data: Dict[str, Any], node: Dict[str, Any]) -> str:
@@ -592,6 +805,10 @@ class TaskTreeApp(App[None]):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "reload", "Reload"),
+        ("/", "search", "Search"),
+        ("s", "configure_search", "Search settings"),
+        ("n", "next_match", "Next match"),
+        ("N,shift+n", "previous_match", "Previous match"),
         ("m", "move_selected", "Move selected"),
         ("u", "undo", "Undo"),
         ("ctrl+z", "undo", "Undo"),
@@ -616,6 +833,10 @@ class TaskTreeApp(App[None]):
         self._last_dropped_intent: Optional[DropIntent] = None
         self._undo_receipt: Optional[Any] = None
         self._status = ""
+        self.search_settings = SearchSettings()
+        self._search_query = ""
+        self._search_matches: list[int] = []
+        self._search_snapshot: Optional[SearchSnapshot] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -646,7 +867,7 @@ class TaskTreeApp(App[None]):
     def _set_status(self, status: str) -> None:
         self._status = status
         try:
-            self.query_one("#status", Static).update(status)
+            self.query_one("#status", Static).update(Text(status))
         except Exception:
             # This is useful for direct, pre-mount seams and keeps status
             # reporting from changing the underlying mutation behavior.
@@ -744,18 +965,23 @@ class TaskTreeApp(App[None]):
         by_id = _node_index(self._data)
         active_id = self._data.get("active_id")
         visible_nodes: Dict[int, Any] = {}
+        self._search_matches = _search_task_ids(
+            self._data, self._search_query, self.search_settings
+        )
+        match_ids = set(self._search_matches)
 
         def add_node(parent: Any, node_id: int) -> None:
             node = by_id[node_id]
             child_ids = node["children"]
+            label = _styled_node_label(node, active_id, matched=node_id in match_ids)
             if child_ids:
                 tree_node = parent.add(
-                    _node_label(node, active_id),
+                    label,
                     data=node_id,
                     expand=node_id in self._expanded_ids,
                 )
             else:
-                tree_node = parent.add_leaf(_node_label(node, active_id), data=node_id)
+                tree_node = parent.add_leaf(label, data=node_id)
             visible_nodes[node_id] = tree_node
             for child_id in child_ids:
                 add_node(tree_node, child_id)
@@ -784,6 +1010,8 @@ class TaskTreeApp(App[None]):
             # numbers and Textual clamps the cursor back to the first row.
             self.call_after_refresh(tree.move_cursor, visible_nodes[selected_id])
             self._show_details(selected_id)
+        if self._search_query and self._search_status_visible():
+            self._show_search_status()
 
     def _refresh_drag_markers(self) -> None:
         """Repaint marker styles without changing tree layout or node objects."""
@@ -798,6 +1026,8 @@ class TaskTreeApp(App[None]):
         tree = self.query_one(DragTree)
         if not tree.dragging and self._status.startswith("Moving #"):
             self._set_status("")
+            if self._search_query:
+                self._show_search_status()
         self._refresh_drag_markers()
 
     def _parent_by_child(self) -> Dict[int, int]:
@@ -1001,6 +1231,12 @@ class TaskTreeApp(App[None]):
         if isinstance(node_id, int):
             self._selected_id = node_id
             self._show_details(node_id)
+            if (
+                self._search_query
+                and self._search_status_visible()
+                and not self.query_one(DragTree).dragging
+            ):
+                self._show_search_status()
 
     def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
         if isinstance(event.node.data, int):
@@ -1009,6 +1245,165 @@ class TaskTreeApp(App[None]):
     def on_tree_node_collapsed(self, event: Tree.NodeCollapsed) -> None:
         if isinstance(event.node.data, int):
             self._expanded_ids.discard(event.node.data)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        if action in {"next_match", "previous_match"}:
+            return bool(self._search_query)
+        return True
+
+    def _can_start_search(self) -> bool:
+        tree = self.query_one(DragTree)
+        if tree.dragging or tree.pending_drag:
+            self.notify("Finish or cancel the move before entering search")
+            return False
+        return True
+
+    def action_search(self) -> None:
+        if self._can_start_search():
+            self._search_snapshot = SearchSnapshot(
+                self._search_query,
+                self._selected_id,
+                set(self._expanded_ids),
+                self._status,
+            )
+            self.push_screen(
+                SearchInputScreen(self._search_query, self._preview_search),
+                self._submit_search,
+            )
+
+    def action_configure_search(self) -> None:
+        if self._can_start_search():
+            self.push_screen(
+                SearchConfigScreen(self.search_settings), self._search_configured
+            )
+
+    def _submit_search(self, query: Optional[str]) -> None:
+        snapshot = self._search_snapshot
+        if snapshot is None:
+            return
+        if query is None:
+            self._search_query = snapshot.query
+            self._selected_id = snapshot.selected_id
+            self._expanded_ids = set(snapshot.expanded_ids)
+            self._render_tree()
+            self._set_status(snapshot.status)
+        else:
+            # Apply the final value even if its Changed message is still queued.
+            self._preview_search(query)
+        self._search_snapshot = None
+        self.query_one(DragTree).focus()
+        self.refresh_bindings()
+
+    def _preview_search(self, query: str) -> None:
+        snapshot = self._search_snapshot
+        if snapshot is None:
+            return
+        self._search_query = query
+        previous_matches = set(self._search_matches)
+        self._search_matches = _search_task_ids(
+            self._data, query, self.search_settings
+        )
+        tree = self.query_one(DragTree)
+        match_ids = set(self._search_matches)
+        changed_ids = previous_matches ^ match_ids
+        by_id = _node_index(self._data)
+        # Keep node objects and geometry stable, repainting only changed matches.
+        for tree_node in tree._tree_nodes.values():
+            if tree_node.data in changed_ids:
+                tree_node.set_label(
+                    _styled_node_label(
+                        by_id[tree_node.data],
+                        self._data.get("active_id"),
+                        matched=tree_node.data in match_ids,
+                    )
+                )
+        # Every edit searches from the original cursor, not the last preview.
+        self._selected_id = snapshot.selected_id
+        if self._search_matches:
+            self._navigate_search(1, include_current=True, focus_tree=False)
+        else:
+            if self._selected_id is not None:
+                self._show_details(self._selected_id)
+                self.call_after_refresh(self._move_search_cursor, self._selected_id)
+            if query:
+                self._show_search_status()
+            else:
+                self._set_status("Search cleared")
+
+    def _search_configured(self, result: None) -> None:
+        # Recompute existing results without unexpectedly moving the cursor.
+        self._render_tree()
+        self.query_one(DragTree).focus()
+        if self._search_query:
+            self._show_search_status()
+
+    def _search_status_visible(self) -> bool:
+        # Do not replace move confirmations or errors with a match count.
+        return not self._status or self._status.startswith(("Search ", "No matches for "))
+
+    def _show_search_status(self) -> None:
+        if not self._search_matches:
+            self._set_status(f"No matches for {self._search_query!r}")
+        elif self._selected_id in self._search_matches:
+            index = self._search_matches.index(self._selected_id) + 1
+            self._set_status(
+                f"Search {self._search_query!r}: {index}/{len(self._search_matches)}"
+            )
+        else:
+            self._set_status(
+                f"Search {self._search_query!r}: {len(self._search_matches)} matches"
+            )
+
+    def _move_search_cursor(self, task_id: int) -> None:
+        # A later edit or cancellation may supersede a queued cursor movement.
+        if task_id == self._selected_id:
+            tree = self.query_one(DragTree)
+            node = tree._task_node(task_id)
+            if node is not None:
+                tree.move_cursor(node)
+
+    def _navigate_search(
+        self, direction: int, *, include_current: bool = False, focus_tree: bool = True
+    ) -> None:
+        tree = self.query_one(DragTree)
+        if tree.dragging or tree.pending_drag:
+            self.notify("Finish or cancel the move before navigating matches")
+            return
+        matches = self._search_matches
+        if not matches:
+            self._show_search_status()
+            return
+        # Include every task in traversal order, not just currently visible rows.
+        ordered = _task_ids_in_order(self._data)
+        positions = {task_id: index for index, task_id in enumerate(ordered)}
+        cursor = positions.get(self._selected_id, -1 if direction > 0 else len(ordered))
+        candidates = matches if direction > 0 else list(reversed(matches))
+        target = next(
+            (
+                task_id
+                for task_id in candidates
+                if (positions[task_id] - cursor) * direction > 0
+                or (include_current and task_id == self._selected_id)
+            ),
+            candidates[0],
+        )
+        self._selected_id = target
+        for task_id in self._branch_ids_for(target) - {target}:
+            ancestor = tree._task_node(task_id)
+            if ancestor is not None:
+                ancestor.expand()
+                self._expanded_ids.add(task_id)
+        self.call_after_refresh(self._move_search_cursor, target)
+        if focus_tree:
+            tree.focus()
+        self._show_details(target)
+        self._show_search_status()
+
+    def action_next_match(self) -> None:
+        self._navigate_search(1)
+
+    def action_previous_match(self) -> None:
+        self._navigate_search(-1)
 
     def action_reload(self) -> None:
         self._undo_receipt = None
