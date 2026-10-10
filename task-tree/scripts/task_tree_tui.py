@@ -12,13 +12,19 @@ from typing import Any, Callable, Dict, Optional, Set
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.events import Click, MouseDown, MouseMove, MouseUp
+from textual.events import Click, MouseDown, MouseMove, MouseUp, Resize
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Footer, Header, Input, Static, Tree
 from textual.widgets.tree import UnknownNodeID
 from rich.style import Style
 from rich.text import Text
+
+import task_tree_notepad as notepad_storage
+
+
+NARROW_LAYOUT_BASE_COLUMNS = 90
+NARROW_LAYOUT_COLUMNS_PER_LEVEL = 8
 
 
 STATUS_MARKERS = {
@@ -798,7 +804,12 @@ class TaskTreeApp(App[None]):
         border: round $primary;
         padding: 1 2;
     }
+    Screen.narrow #layout { layout: vertical; }
+    Screen.narrow #tree-pane { width: 100%; height: 45%; }
+    Screen.narrow #details-pane { width: 100%; height: 55%; }
     #details { width: 100%; height: auto; }
+    #notepad-spacer { height: 1fr; min-height: 0; }
+    #notepad { width: 100%; height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; }
     #status { height: 1; padding: 0 1; color: $text-muted; }
     Tree { height: 1fr; }
     """
@@ -833,6 +844,9 @@ class TaskTreeApp(App[None]):
         self._last_dropped_intent: Optional[DropIntent] = None
         self._undo_receipt: Optional[Any] = None
         self._status = ""
+        
+        self._notepad = None
+        
         self.search_settings = SearchSettings()
         self._search_query = ""
         self._search_matches: list[int] = []
@@ -844,10 +858,13 @@ class TaskTreeApp(App[None]):
             yield DragTree("Tasks", id="tree-pane")
             with VerticalScroll(id="details-pane"):
                 yield Static("Loading task tree…", id="details")
+                yield Static("", id="notepad-spacer")
+                yield Static("", id="notepad", markup=False)
         yield Static("", id="status")
         yield Footer()
 
     def on_mount(self) -> None:
+        self._update_responsive_layout(self.size.width)
         tree = self.query_one(DragTree)
         tree.show_root = False
         tree.show_guides = True
@@ -859,9 +876,19 @@ class TaskTreeApp(App[None]):
         )
         self._reload_tree()
 
+    def on_resize(self, event: Resize) -> None:
+        self._update_responsive_layout(event.size.width)
+
+    def _update_responsive_layout(self, width: int) -> None:
+        """Use durable active ancestry, never selection or expansion state."""
+        depth = max(0, len(self._active_branch_ids()) - 1)
+        threshold = NARROW_LAYOUT_BASE_COLUMNS + NARROW_LAYOUT_COLUMNS_PER_LEVEL * depth
+        self.screen.set_class(width < threshold, "narrow")
+
     def _read_data(self) -> Dict[str, Any]:
         # The store owns schema validation and lock behavior.
         with self.store.locked_data() as data:
+            self._notepad = notepad_storage.snapshot(self.store.path)
             return copy.deepcopy(data)
 
     def _set_status(self, status: str) -> None:
@@ -936,8 +963,11 @@ class TaskTreeApp(App[None]):
             self._data = self._read_data()
         except (OSError, ValueError) as exc:
             self._update_details(f"Could not read task tree:\n{exc}")
+            self.query_one("#notepad", Static).update("Tree-wide notepad\nUnavailable: task tree could not reload")
             self.notify("Could not reload task tree", severity="error")
             return
+
+        self.query_one("#notepad", Static).update(notepad_storage.render(self._notepad))
 
         # On entry, reveal the active task's context without expanding an
         # entire large workstream. Subsequent reloads retain the user's own
@@ -960,6 +990,7 @@ class TaskTreeApp(App[None]):
         sufficient for every Textual lifecycle.
         """
 
+        self._update_responsive_layout(self.size.width)
         tree = self.query_one(DragTree)
         tree.clear()
         by_id = _node_index(self._data)
