@@ -49,6 +49,25 @@ children unless the user explicitly says to override tree order. Never manually
 activate a terminal task; an automatic `return_to_id` continuation may
 intentionally restore focus to one for review, reopening, or traversal.
 
+### Tree-wide notepad
+
+Before beginning work on a task, inspect its details and the tree-wide notepad.
+The CLI includes the note automatically in snapshots and active-task detail
+output (text and JSON); no separate notepad read is needed. Merely changing the
+active task does not require another read. Use the notepad for cross-task
+navigation facts, workflow preferences and caveats, not execution permissions,
+task status, acceptance criteria or a second task list. Prefer storing cross-task
+preferences in the notepad unless a clear alternative home is known. If such a
+home exists, maintain the preference there rather than duplicating it; add a
+notepad pointer when useful.
+Keep essential task-specific constraints in task bodies. Maintain the note rather
+than accumulating history; link detailed evidence and remove stale entries.
+
+Use the `notepad show`, `notepad replace` and `notepad clear` CLI operations,
+not direct writes to reserved storage. See
+[the notepad contract](references/artifacts-and-events.md#tree-wide-notepad)
+for limits, ownership, isolation and cleanup behavior.
+
 ## Creating and Placing Work
 
 Tasks are small, concrete units with a summary and body. A parent is a real
@@ -138,6 +157,37 @@ Before compaction, restart, or handoff on nontrivial active work:
 `notes/` is overflow or backup, never the sole compaction handoff. A completed
 task body may concisely state the result and link an artifact, but should not
 become the full report.
+
+### Compact but readable handoffs
+
+Task bodies must remain understandable across sessions and by different agents.
+“Compact” means removing unnecessary content—not removing word boundaries or
+requiring readers to reconstruct intent.
+
+**Prefer:**
+- Concise sentences and structured sections: scope, constraints, acceptance
+  criteria, and handoff.
+- Removing repetition and obsolete history.
+- Linking detailed evidence while retaining essential instructions in the body.
+- Established abbreviations and exact code identifiers.
+- Short names for recurring concepts, with explicit definitions available
+  wherever those names are used.
+
+**Avoid:**
+- Concatenating ordinary words, such as `immutablefullfacts`.
+- Unexplained abbreviations or invented terms.
+- Compressing several distinct obligations into an ambiguous phrase.
+- Moving essential safety constraints or completion gates exclusively into
+  linked artifacts.
+- Assuming fewer characters means fewer tokens.
+
+Before saving a task body, check:
+1. Can another agent identify the required actions and completion conditions
+   without reconstructing the author’s intent?
+2. Are unfamiliar terms defined and references clearly identified?
+3. Has shortening preserved ownership, permissions, uncertainty, and dependencies?
+
+If not, expand or restructure the wording.
 
 ## Lifecycle and Safety
 

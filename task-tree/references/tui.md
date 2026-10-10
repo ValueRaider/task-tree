@@ -18,9 +18,26 @@ Use Up/Down or the mouse to select a task. Right expands it; Left collapses it,
 or moves to its parent when it is already collapsed or has no children. Space
 or the expander toggles the subtree. Press `r` to reload and `q` to quit.
 
-The right-hand details pane scrolls with the mouse wheel. Press `Tab` to focus
+The stacking breakpoint is **90 + 8 × active task depth** terminal columns.
+A root task has depth 0; no active task uses the 90-column base. Below the
+breakpoint the tree appears above the task-details/notepad pane; at or above it
+they remain side by side. Depth comes from the durable active task’s ancestors,
+not the selected task or expanded subtree. Expanding/collapsing nodes and
+changing selection therefore do not change the breakpoint. It updates on resize
+and when refreshed tree data changes active ancestry, without rebuilding the
+tree merely for a resize. In stacked mode the tree gets 45% of the available
+main height and the details pane gets 55%.
+
+The details pane (right-hand or below the tree) scrolls with the mouse wheel. Press `Tab` to focus
 it, then use Up/Down, PageUp/PageDown, Home, or End. Selecting another task
-resets the details to the top. On startup, the viewer reveals the branch to
+resets the details to the top. A labelled **Tree-wide notepad** section appears
+beneath the selected task print-out inside this same details scroll pane,
+not in the tree pane. With short details, spare space above the note positions it
+at the bottom of the pane; with long details, it follows them in the scroll flow.
+It stays shared when selection changes; `r` reloads both
+the tree and note. Long task details may require scrolling to reach it. The note
+is displayed literally, with explicit missing/error status, including when the
+tree has no tasks. On startup, the viewer reveals the branch to
 the active task and expands that task when it has children.
 
 ## Relocate a task
