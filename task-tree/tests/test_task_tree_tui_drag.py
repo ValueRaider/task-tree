@@ -8,11 +8,13 @@ import math
 from pathlib import Path
 
 import pytest
-from rich.style import Style
-from textual.events import MouseDown, MouseMove, MouseUp
 
 
 pytest.importorskip("textual")
+pytest.importorskip("rich")
+
+from rich.style import Style
+from textual.events import MouseDown, MouseMove, MouseUp
 
 TEST_DIR = Path(__file__).resolve().parent
 SCRIPTS_DIR = TEST_DIR.parent / "scripts"

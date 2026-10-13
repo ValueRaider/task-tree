@@ -71,3 +71,9 @@ completes.
 anchor must have the same parent. Here, pending means `in_progress` or
 `not_started`. `--before-first-pending` appends when no pending sibling exists.
 Use native `reorder --help` for the complete accepted syntax.
+
+## Structured empty results
+
+`list --json`, `children --json` and `query --json` return their normal JSON
+envelopes with an empty `nodes` list when there are no matches. Human no-match
+prose belongs only to text output; the JSON shape does not depend on emptiness.

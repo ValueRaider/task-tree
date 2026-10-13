@@ -1168,8 +1168,8 @@ class TaskTreeApp(App[None]):
             current_parent_id = self._parent_id_in_data(data, receipt.source_id)
             if current_parent_id != receipt.destination_parent_id:
                 raise ValueError("the moved task is no longer at its drop destination")
-            moved_at = source.get("events", {}).get("moved_at")
-            if moved_at != receipt.moved_at:
+            move_marker = source.get("events", {}).get("move_marker")
+            if move_marker != receipt.move_marker:
                 raise ValueError("the moved task changed after the drop")
 
             if receipt.original_parent_id is not None:

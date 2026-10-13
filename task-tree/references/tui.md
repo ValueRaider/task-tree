@@ -11,7 +11,7 @@ For a non-default tree, place the global option before the command:
 
 ```bash
 python .agents/skills/task-tree/scripts/task_tree.py \
-  --tree-file path/to/tree.json tui
+  --tree-dir path/to/store tui
 ```
 
 Use Up/Down or the mouse to select a task. Right expands it; Left collapses it,
@@ -107,7 +107,12 @@ task text stays aligned. The placement preview restyles source and candidate
 labels without changing layout or expansion.
 
 Press `U` or `Ctrl+Z` to undo the latest TUI relocation when it is still safe.
-Undo is session-local, and reload clears it. Relocations use the normal locked
+Undo is session-local, and reload clears it. Its stale-change guard uses a
+per-move opaque marker that changes on every relocation, not a wall-clock
+value. Human `moved_at` timestamps remain actual timestamps; they are not advanced
+into the future to simulate identity. Capture and compare the marker under the
+normal store lock. A newer move invalidates an earlier receipt even within the
+same second and same parent; no undo journal or schema version is introduced. Relocations use the normal locked
 store rather than editing JSON directly.
 
 ## Compact detail rendering

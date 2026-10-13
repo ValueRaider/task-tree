@@ -27,8 +27,9 @@ python .agents/skills/task-tree/scripts/task_tree.py clear \
 ```
 
 Use `<command> --help` before adding options such as `delete --force` or
-changing clear/reset cleanup. The global `--tree-file PATH` option goes before
-the subcommand.
+changing clear/reset cleanup. The global `--tree-dir PATH` option goes before
+the subcommand. `--tree-file PATH` is deprecated and selects only its parent
+directory.
 
 ## Safe inventory and ownership
 
@@ -59,8 +60,9 @@ pruning records a failure; suspicious entries alone are an inspection result.
   directories.
 - `clear` cleans task or shared artifacts only with `--prune-files` or
   `--prune-shared`; otherwise those artifacts intentionally remain. This includes
-  the tree-wide notepad: pruning shared removes all notes for trees sharing that
-  parent directory; ordinary reset/drop/clear preserves them.
+  the selected store's tree-wide notepad and any retained legacy notes under
+  that store's `shared/` directory. Other selected store directories are not
+  affected; ordinary reset/drop/clear preserves shared data.
 - `--drop-file` durably removes the tree JSON instead of writing an empty
   tree. Unsafe shared roots and suspicious task-root entries are retained.
 
