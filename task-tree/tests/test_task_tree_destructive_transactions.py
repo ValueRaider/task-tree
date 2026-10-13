@@ -54,7 +54,7 @@ def load_tree(tree_path: Path) -> dict:
 
 
 def command_args(tree_path: Path, command: str) -> list[str]:
-    base = ["--tree-file", str(tree_path)]
+    base = ["--tree-dir", str(tree_path.parent)]
     if command == "delete":
         return [*base, "delete", "1", "--json"]
     if command == "prune-files":
@@ -226,7 +226,7 @@ def test_partial_recursive_delete_is_retryable_with_scan_files(
 
     monkeypatch.setattr(task_tree.shutil, "rmtree", real_rmtree)
     assert task_tree.main(
-        ["--tree-file", str(tree_path), "scan-files", "--prune", "--json"]
+        ["--tree-dir", str(tree_path.parent), "scan-files", "--prune", "--json"]
     ) == 0
     retry_payload = json.loads(capsys.readouterr().out)
     assert retry_payload["removed"] == [
@@ -346,8 +346,8 @@ def test_clear_prunes_canonical_directories_but_retains_suspicious_entries(
 
     exit_code = task_tree.main(
         [
-            "--tree-file",
-            str(tree_path),
+            "--tree-dir",
+            str(tree_path.parent),
             "clear",
             "--prune-files",
             "--json",
@@ -382,8 +382,8 @@ def test_clear_never_follows_a_shared_directory_symlink(
 
     exit_code = task_tree.main(
         [
-            "--tree-file",
-            str(tree_path),
+            "--tree-dir",
+            str(tree_path.parent),
             "clear",
             "--prune-shared",
             "--json",
@@ -438,7 +438,7 @@ def test_clear_and_reset_flag_combinations(
     (shared / "shared.txt").write_text("shared", encoding="utf-8")
 
     exit_code = task_tree.main(
-        ["--tree-file", str(tree_path), command, *flags, "--json"]
+        ["--tree-dir", str(tree_path.parent), command, *flags, "--json"]
     )
 
     assert exit_code == 0
@@ -470,8 +470,8 @@ def test_drop_file_failure_happens_before_cleanup(
     with pytest.raises(OSError, match="injected drop failure"):
         task_tree.main(
             [
-                "--tree-file",
-                str(tree_path),
+                "--tree-dir",
+                str(tree_path.parent),
                 "clear",
                 "--drop-file",
                 "--prune-files",
@@ -508,8 +508,8 @@ def test_post_drop_error_leaves_artifacts_for_recovery(
     with pytest.raises(OSError, match="post-drop failure"):
         task_tree.main(
             [
-                "--tree-file",
-                str(tree_path),
+                "--tree-dir",
+                str(tree_path.parent),
                 "reset",
                 "--drop-file",
                 "--json",
@@ -534,7 +534,7 @@ def test_human_cleanup_failure_names_recovery_command(
     monkeypatch.setattr(task_tree.shutil, "rmtree", fail_cleanup)
 
     assert task_tree.main(
-        ["--tree-file", str(tree_path), "prune-files", "1"]
+        ["--tree-dir", str(tree_path.parent), "prune-files", "1"]
     ) == 1
 
     output = capsys.readouterr().out
@@ -561,7 +561,7 @@ def test_reset_holds_exclusive_lock_through_cleanup_before_id_reuse(
 
     reset_thread = threading.Thread(
         target=lambda: reset_result.append(
-            task_tree.main(["--tree-file", str(tree_path), "reset", "--json"])
+            task_tree.main(["--tree-dir", str(tree_path.parent), "reset", "--json"])
         )
     )
     reset_thread.start()
@@ -572,8 +572,8 @@ def test_reset_holds_exclusive_lock_through_cleanup_before_id_reuse(
         [
             sys.executable,
             str(SCRIPT),
-            "--tree-file",
-            str(tree_path),
+            "--tree-dir",
+            str(tree_path.parent),
             "add",
             "Reused ID",
             "--with-files",

@@ -95,7 +95,7 @@ def test_drop_persists_subtree_and_undo_restores_anchors(tmp_path):
             assert len(calls) == 1
             receipt = app._undo_receipt
             assert receipt is not None
-            moved_at = receipt.moved_at
+            move_marker = receipt.move_marker
 
             app.action_undo()
             await pilot.pause()
@@ -104,7 +104,7 @@ def test_drop_persists_subtree_and_undo_restores_anchors(tmp_path):
             assert next(node for node in restored["nodes"] if node["id"] == 4)["children"] == [5, 6]
             source = next(node for node in restored["nodes"] if node["id"] == 2)
             assert source["children"] == [7]
-            assert source["events"]["moved_at"] != moved_at
+            assert source["events"]["move_marker"] != move_marker
             assert len(calls) == 2
             assert app._undo_receipt is None
 
@@ -153,7 +153,7 @@ def test_external_change_and_missing_anchor_refuse_without_mutation(tmp_path):
             await pilot.pause()
             app.handle_drag_drop(task_tree_tui.DropIntent(2, 4, before_id=6))
             await pilot.pause()
-            # Move the source externally: its moved_at and current owner no
+            # Move the source externally: its move marker and current owner no
             # longer satisfy the retained receipt.
             with store.locked_data(write=True) as data:
                 task_tree.relocate_node(data, 2, None)

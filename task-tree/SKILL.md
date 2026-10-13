@@ -15,14 +15,19 @@ If its CLI lacks an operation, inspect and extend it deliberately rather than
 editing the JSON directly. Before using an unfamiliar mutation flag, consult
 `task_tree.py --help`, `<command> --help`, or the argument parser—do not guess.
 
-The default tree is `./task_tree/tree.json`. Put `--tree-file PATH` before the
-command to select another tree. That selected file’s parent owns its `files/`,
-`shared/`, and lock artifacts. The runtime uses a filesystem lock and durable
+The default store directory is `./task_tree`, with canonical tree
+`tree.json`. Put `--tree-dir PATH` before the command to select another store;
+that directory owns `tree.json`, `files/`, `shared/`, and the lock artifact.
+Even a read renames a sole differently named JSON file to `tree.json`;
+multiple JSON files cause an error before tree or artifact changes.
+`--tree-file PATH` is a strictly deprecated selector for PATH's parent
+directory and warns on stderr. The runtime uses a filesystem lock and durable
 atomic replacement for the tree JSON; always use the script so concurrent
 changes serialize safely. Artifact-directory cleanup is a separate,
-crash-consistent step, not part of the atomic JSON replacement. It validates
-the current parent-owned ordering schema before every operation; see
-[schema.md](references/schema.md) when diagnosing a schema error.
+crash-consistent step, not part of the atomic JSON replacement. Ordinary reads
+and tree writes validate the parent-owned ordering schema; see
+[schema.md](references/schema.md) when diagnosing errors or using the
+`clear-active` / destructive `clear` / `reset` recovery exceptions.
 
 ## Inspecting State
 
@@ -41,6 +46,8 @@ Use `--full-tree` after a mutation only when it is genuinely needed.
 
 Read [tui.md](references/tui.md) before using the optional interactive viewer;
 it covers its dependency, navigation, relocation, and session-local undo.
+For maintenance module boundaries, optional dependencies, and test commands,
+see [development.md](references/development.md).
 
 Before choosing work, inspect the active task and/or run `next`. Keep one
 actionable task active when there is a clear focus. Do not jump to a sibling
@@ -76,6 +83,11 @@ Any task may receive children; parent/child expresses relationship, not type.
 Adding children does not make the parent complete or non-actionable.
 The frontier comprises tasks without children; it does not determine their
 status, readiness, or whether a parent has work of its own.
+
+When planning work involving multiple roles, explicitly identify the responsible
+role(s) for every task in its summary or body. If a task involves more than one
+role, state what each handles and where responsibility passes between them;
+split it into separately owned tasks when that makes the handoff clearer.
 
 Before substantive execution, decide and record whether the objective is one
 coherent task or a staged parent. Stage it before implementation or delegation
@@ -137,11 +149,15 @@ and the detailed artifact contract are in
 [artifacts-and-events.md](references/artifacts-and-events.md).
 
 Destructive commands commit the tree before attempting managed artifact
-cleanup. If cleanup is interrupted or reports retained paths, use `scan-files`
-to inspect them and `scan-files --prune` to remove only canonical orphan task
-directories. The scanner reports but never automatically removes suspicious
-entries; see
+cleanup. If cleanup is interrupted or reports retained paths, inspect with
+`scan-files`. Before deleting tasks or artifacts, read
 [destructive-operations.md](references/destructive-operations.md).
+`scan-files --prune` removes all canonical orphan directories in the selected
+store, not one selected leftover; use it only after confirming that the entire
+candidate set may be discarded. An orphan label alone does not establish this.
+For a single collision, follow the
+[preserving attachment procedure](references/artifacts-and-events.md#attachment-and-collision-rules)
+instead of bulk pruning.
 
 Before compaction, restart, or handoff on nontrivial active work:
 
@@ -156,38 +172,8 @@ Before compaction, restart, or handoff on nontrivial active work:
 
 `notes/` is overflow or backup, never the sole compaction handoff. A completed
 task body may concisely state the result and link an artifact, but should not
-become the full report.
-
-### Compact but readable handoffs
-
-Task bodies must remain understandable across sessions and by different agents.
-“Compact” means removing unnecessary content—not removing word boundaries or
-requiring readers to reconstruct intent.
-
-**Prefer:**
-- Concise sentences and structured sections: scope, constraints, acceptance
-  criteria, and handoff.
-- Removing repetition and obsolete history.
-- Linking detailed evidence while retaining essential instructions in the body.
-- Established abbreviations and exact code identifiers.
-- Short names for recurring concepts, with explicit definitions available
-  wherever those names are used.
-
-**Avoid:**
-- Concatenating ordinary words, such as `immutablefullfacts`.
-- Unexplained abbreviations or invented terms.
-- Compressing several distinct obligations into an ambiguous phrase.
-- Moving essential safety constraints or completion gates exclusively into
-  linked artifacts.
-- Assuming fewer characters means fewer tokens.
-
-Before saving a task body, check:
-1. Can another agent identify the required actions and completion conditions
-   without reconstructing the author’s intent?
-2. Are unfamiliar terms defined and references clearly identified?
-3. Has shortening preserved ownership, permissions, uncertainty, and dependencies?
-
-If not, expand or restructure the wording.
+become the full report. For handoff clarity and compactness guidance, see
+[artifacts-and-events.md](references/artifacts-and-events.md#compact-readable-handoffs).
 
 ## Lifecycle and Safety
 

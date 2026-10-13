@@ -8,8 +8,8 @@ python .agents/skills/task-tree/scripts/task_tree.py partition <parent-id> \
   --from-file PATH [--set-active-first] [--full-tree]
 ```
 
-Place the global `--tree-file PATH` option before `partition` when selecting a
-non-default tree. `--set-active-first` activates only the first newly created
+Place the global `--tree-dir PATH` option before `partition` when selecting a
+non-default store. `--tree-file PATH` is deprecated. `--set-active-first` activates only the first newly created
 child. Mutations print the compact snapshot by default; `--full-tree` requests
 the full post-mutation tree.
 

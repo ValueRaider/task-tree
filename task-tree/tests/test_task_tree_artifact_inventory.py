@@ -115,7 +115,8 @@ def test_reset_id_reuse_cannot_adopt_a_residual_directory(tmp_path: Path) -> Non
 
     assert result.returncode == 2
     assert "artifact path collision for task 1" in result.stderr
-    assert "scan-files --prune" in result.stderr
+    assert "operator-selected location" in result.stderr
+    assert "--attach-existing" in result.stderr
     assert evidence.read_text(encoding="utf-8") == "preserve"
     data = load_tree(tree_path)
     assert data["next_id"] == 1
@@ -133,7 +134,8 @@ def test_ensure_files_collision_leaves_null_metadata_and_recovery_data(tmp_path:
     result = run_tree(tmp_path, "ensure-files", "1")
 
     assert result.returncode == 2
-    assert "inspect it or run scan-files --prune" in result.stderr
+    assert "operator-selected location" in result.stderr
+    assert "--attach-existing" in result.stderr
     assert load_tree(tree_path)["nodes"][0]["files_dir"] is None
     assert evidence.read_text(encoding="utf-8") == "keep"
 

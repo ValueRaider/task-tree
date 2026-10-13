@@ -9,7 +9,7 @@ from pathlib import Path
 TEST_DIR = Path(__file__).resolve().parent
 SKILL_DIR = TEST_DIR.parent
 SCRIPTS_DIR = SKILL_DIR / "scripts"
-RUNTIME_MODULES = ("task_tree.py", "task_tree_schema.py", "json_format.py")
+RUNTIME_MODULES = ("task_tree.py", "task_tree_schema.py", "json_format.py", "task_tree_notepad.py")
 
 
 def deploy_runtime(tmp_path: Path) -> tuple[Path, Path]:
@@ -72,7 +72,7 @@ def write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def test_three_module_bundle_supports_help_create_read_and_mutate(tmp_path):
+def test_runtime_bundle_supports_help_create_read_and_mutate(tmp_path):
     project, script = deploy_runtime(tmp_path)
     assert sorted(path.name for path in script.parent.iterdir()) == sorted(RUNTIME_MODULES)
 
@@ -128,9 +128,9 @@ def test_three_module_bundle_supports_help_create_read_and_mutate(tmp_path):
 
     ensure_help = run_runtime(project, script, "ensure-files", "--help")
     assert ensure_help.returncode == 0, ensure_help.stderr
-    assert "refuse to adopt a pre-existing path" in " ".join(
-        ensure_help.stdout.split()
-    )
+    ensure_help_text = " ".join(ensure_help.stdout.split())
+    assert "refuse to adopt a pre-existing path by default" in ensure_help_text
+    assert "--attach-existing" in ensure_help_text
 
     query_help = run_runtime(project, script, "query", "--help")
     assert query_help.returncode == 0, query_help.stderr
@@ -167,6 +167,12 @@ def test_three_module_bundle_supports_help_create_read_and_mutate(tmp_path):
         "next_after_subtree": None,
         "next_actionable": None,
         "shared_dir": "./task_tree/shared",
+        "notepad": {
+            "path": "task_tree/shared/.task-tree-notepad.md",
+            "status": "missing",
+            "text": None,
+            "error": None,
+        },
     }
 
     add_result = run_runtime(project, script, "add", "First task", "--set-active")
@@ -193,21 +199,24 @@ def test_three_module_bundle_supports_help_create_read_and_mutate(tmp_path):
     assert json.loads(canonical.read_text(encoding="utf-8"))["nodes"][0]["summary"] == "Renamed"
 
 
-def test_default_runtime_uses_only_the_canonical_filename(tmp_path):
+def test_multiple_json_files_are_rejected_before_mutation(tmp_path):
     project, script = deploy_runtime(tmp_path)
     sentinel = project / "task_tree" / "tree-versioned.json"
     sentinel_bytes = b'"not the canonical store"\n'
     sentinel.parent.mkdir(parents=True)
     sentinel.write_bytes(sentinel_bytes)
+    canonical = sentinel.parent / "tree.json"
+    canonical.write_bytes(b"{}\n")
 
     result = run_runtime(project, script, "add", "Canonical task")
 
-    assert result.returncode == 0, result.stderr
-    assert (project / "task_tree" / "tree.json").exists()
+    assert result.returncode == 2
+    assert "multiple JSON files" in result.stderr
+    assert canonical.read_bytes() == b"{}\n"
     assert sentinel.read_bytes() == sentinel_bytes
 
 
-def test_deprecated_environment_store_selection_warns_and_uses_canonical_suffix(tmp_path):
+def test_deprecated_environment_store_selection_uses_parent_directory(tmp_path):
     project, script = deploy_runtime(tmp_path)
 
     agent_result = run_runtime(
@@ -218,10 +227,10 @@ def test_deprecated_environment_store_selection_warns_and_uses_canonical_suffix(
         env_updates={"TASK_TREE_AGENT": "Review Agent"},
     )
     assert agent_result.returncode == 0, agent_result.stderr
-    assert (project / "task_tree" / "review-agent.json").exists()
-    assert not (project / "task_tree" / "review-agent-versioned.json").exists()
+    assert (project / "task_tree" / "tree.json").exists()
+    assert not (project / "task_tree" / "review-agent.json").exists()
     assert "TASK_TREE_AGENT is deprecated" in agent_result.stderr
-    assert "--tree-file ./task_tree/review-agent.json" in agent_result.stderr
+    assert "--tree-dir ./task_tree" in agent_result.stderr
 
     explicit = project / "custom" / "tasks.json"
     explicit_result = run_runtime(
@@ -232,12 +241,13 @@ def test_deprecated_environment_store_selection_warns_and_uses_canonical_suffix(
         env_updates={"TASK_TREE_FILE": str(explicit)},
     )
     assert explicit_result.returncode == 0, explicit_result.stderr
-    assert explicit.exists()
+    assert (explicit.parent / "tree.json").exists()
+    assert not explicit.exists()
     assert "TASK_TREE_FILE is deprecated" in explicit_result.stderr
-    assert f"--tree-file {explicit}" in explicit_result.stderr
+    assert f"--tree-dir {explicit.parent}" in explicit_result.stderr
 
 
-def test_cli_tree_file_selects_store_and_overrides_environment(tmp_path):
+def test_tree_dir_selects_store_and_overrides_environment(tmp_path):
     project, script = deploy_runtime(tmp_path)
     environment_store = project / "environment" / "tree.json"
     cli_store = project / "selected" / "custom.json"
@@ -245,8 +255,8 @@ def test_cli_tree_file_selects_store_and_overrides_environment(tmp_path):
     result = run_runtime(
         project,
         script,
-        "--tree-file",
-        str(cli_store),
+        "--tree-dir",
+        str(cli_store.parent),
         "add",
         "CLI-selected task",
         env_updates={
@@ -256,23 +266,23 @@ def test_cli_tree_file_selects_store_and_overrides_environment(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert cli_store.exists()
+    assert (cli_store.parent / "tree.json").exists()
     assert not environment_store.exists()
     assert not (project / "task_tree" / "ignored-agent.json").exists()
     assert result.stderr == ""
-    persisted = json.loads(cli_store.read_text(encoding="utf-8"))
+    persisted = json.loads((cli_store.parent / "tree.json").read_text(encoding="utf-8"))
     assert persisted["nodes"][0]["summary"] == "CLI-selected task"
 
 
-def test_cli_tree_file_parent_owns_tree_artifacts(tmp_path):
+def test_tree_dir_owns_tree_artifacts(tmp_path):
     project, script = deploy_runtime(tmp_path)
     cli_store = project / "selected" / "custom.json"
 
     add_result = run_runtime(
         project,
         script,
-        "--tree-file",
-        str(cli_store),
+        "--tree-dir",
+        str(cli_store.parent),
         "add",
         "Task with files",
         "--with-files",
@@ -280,8 +290,8 @@ def test_cli_tree_file_parent_owns_tree_artifacts(tmp_path):
     shared_result = run_runtime(
         project,
         script,
-        "--tree-file",
-        str(cli_store),
+        "--tree-dir",
+        str(cli_store.parent),
         "shared-dir",
     )
 
@@ -289,7 +299,7 @@ def test_cli_tree_file_parent_owns_tree_artifacts(tmp_path):
     assert shared_result.returncode == 0, shared_result.stderr
     assert (cli_store.parent / "files" / "1").is_dir()
     assert (cli_store.parent / "shared").is_dir()
-    assert Path(f"{cli_store}.lock").exists()
+    assert (cli_store.parent / "tree.json.lock").exists()
 
 
 def test_runtime_rejects_unsupported_relationship_fields_without_rewriting(tmp_path):
@@ -311,7 +321,7 @@ def test_runtime_rejects_unsupported_relationship_fields_without_rewriting(tmp_p
 
     assert result.returncode == 2
     assert "unsupported or incomplete relationship structure" in result.stderr
-    assert path.read_bytes() == before
+    assert (project / "tree.json").read_bytes() == before
 
 
 def test_read_initializes_and_persists_missing_version_on_populated_current_tree(
@@ -355,7 +365,7 @@ def test_missing_version_is_not_persisted_when_current_graph_is_invalid(tmp_path
 
     assert result.returncode == 2
     assert "owning position" in result.stderr
-    assert path.read_bytes() == before
+    assert (project / "tree.json").read_bytes() == before
 
 
 def test_empty_tree_without_version_is_not_inferred_or_rewritten(tmp_path):
@@ -379,7 +389,7 @@ def test_empty_tree_without_version_is_not_inferred_or_rewritten(tmp_path):
 
     assert result.returncode == 2
     assert "missing required schema_version" in result.stderr
-    assert path.read_bytes() == before
+    assert (project / "tree.json").read_bytes() == before
 
 
 def test_clear_active_repairs_only_the_invalid_focus_pointer(tmp_path):
@@ -414,7 +424,7 @@ def test_clear_active_does_not_rewrite_structurally_invalid_tree(tmp_path):
 
     assert result.returncode == 2
     assert "owning position" in result.stderr
-    assert path.read_bytes() == before
+    assert (project / "tree.json").read_bytes() == before
 
 
 def test_malformed_json_has_readable_error_and_is_not_rewritten(tmp_path):
@@ -432,4 +442,4 @@ def test_malformed_json_has_readable_error_and_is_not_rewritten(tmp_path):
 
     assert result.returncode == 2
     assert "Expecting property name" in result.stderr
-    assert path.read_bytes() == before
+    assert (project / "tree.json").read_bytes() == before

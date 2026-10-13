@@ -2,12 +2,65 @@
 
 ## Canonical store and selection
 
-The ordinary shared store is `task_tree/tree.json`. The `--tree-file PATH`
-global command-line option selects an explicit store for one invocation. Schema
-versions never appear in these filenames, and the runtime does not probe
-alternative filenames to find a tree with a different format. The selected JSON
-file's parent directory owns the corresponding `files/`, `shared/`, and lock
-artifacts.
+The ordinary store directory is `task_tree/`. Select another directory with
+`--tree-dir PATH` before the command. The directory owns `tree.json`,
+`tree.json.lock`, `files/` and `shared/`; do not create a tree-name subdirectory.
+Independent trees use independent directories chosen by the caller.
+
+Selection is directory-based for every command and legacy selection route.
+Inspect immediate JSON files only, not JSON artifacts inside files/ or shared/:
+
+- No JSON file: use `tree.json`; normal write commands create it. Read commands
+  may report an empty tree without creating its JSON.
+- Exactly one JSON file already named `tree.json`: use it.
+- Exactly one JSON file with another name: rename it to `tree.json` before the
+  requested operation, preserving its bytes. Renaming is user-authorized even
+  for a read invocation; report the old and new paths on stderr.
+- Multiple JSON files: error listing the conflicting paths. Do not choose,
+  overwrite, rename or prune anything. This includes destructive commands.
+
+`--tree-file PATH` is strictly deprecated: convert its filepath to the parent
+folder, then apply those same rules. Warn on stderr and recommend the concrete
+`--tree-dir` replacement. The old basename is not a second selection rule.
+`--tree-dir` and `--tree-file` are mutually exclusive. Explicit CLI selection
+wins over the legacy TASK_TREE_FILE/TASK_TREE_AGENT environment selectors;
+legacy selectors also reduce to their parent directory and warn to use
+`--tree-dir`. Do not create named subfolders or permit an environment bypass.
+
+All cooperating current commands acquire the directory's canonical
+`tree.json.lock` before checking/renaming the JSON or touching artifacts.
+Read-time canonicalization takes an exclusive lock for the rename; the normal
+shared-read behavior can resume afterward. The multiple-file check also applies
+when reset/clear skips parsing invalid tree contents. Cutover assumes old
+program versions are not running concurrently; it does not synchronize arbitrary
+external filesystem changes or old filename-specific locks.
+
+Existing task artifact paths remain in the same parent directory. A legacy
+notepad for JSON basename NAME is exactly
+`shared/.task-tree-notepad-<SHA-256 of filesystem-encoded NAME>.md`; the default
+`tree.json` instead uses `shared/.task-tree-notepad.md`. The legacy note begins
+with `<!-- task-tree managed notepad: "NAME" -->` and a newline, with NAME encoded
+as a JSON string (including its normal escaping). Only this exact managed path
+and header identify the legacy note; do not search arbitrary Markdown files.
+
+When renaming an existing noncanonical tree with such a legacy notepad, preserve
+that note's text at the canonical tree's note path before renaming the JSON.
+The canonical note uses the managed header for `tree.json`; compare note text
+without the header. Refuse conflicting canonical/legacy note texts without overwriting either;
+matching text is not a conflict. Keep the legacy note as retained recovery
+material rather than deleting it. These are two filesystem changes, not an
+atomic cross-file transaction: a failed preparation leaves the original tree
+and note, possibly with an identical canonical note copy. A later invocation
+can inspect that state; never claim an error proves no rename occurred. Report
+native I/O errors and actual paths; no automatic retry, rollback or journal.
+
+This is a bounded deprecation for existing callers/data explicitly approved by
+the user, not a multi-tree store inside one directory. Each selected directory
+owns one canonical tree and its associated `files/` and `shared/` data; use a
+separate selected directory for each independent tree. Existing evidence is
+read only from an explicitly attached canonical task directory; recovery
+attachment rules are in [artifacts-and-events.md](artifacts-and-events.md#attachment-and-collision-rules).
+No schema-version increment or broad data migration is introduced.
 
 ## Current stored shape
 
@@ -59,7 +112,9 @@ deleted with their task record, but task-tree reports and retains the named
 filesystem path. A null `files_dir` does not prove the canonical path is absent:
 an interrupted cleanup may leave an orphan for `scan-files` to report.
 
-`events` is a lifecycle-timestamp object. Artifact attachment records
+`events` holds lifecycle metadata, mostly timestamps, plus the opaque
+`move_marker` used by the [TUI undo guard](tui.md#relocate-a-task). The marker
+identifies a relocation; it is not a timestamp. Artifact attachment records
 `files_created_at`; logical detachment records `files_detached_at` at the tree
 commit and deliberately makes no claim that later directory cleanup succeeded.
 
@@ -78,11 +133,15 @@ commit and deliberately makes no claim that later directory cleanup succeeded.
 8. Every stored `return_to_id` resolves to an existing task and does not point
    to its own task or a descendant.
 
-Reads validate these invariants before commands operate on the tree, and every
-write validates them again before atomic replacement. `clear-active` is the one
-recovery exception: its read may skip only active-pointer validation, then it
-sets the pointer to null and performs full validation before writing. It cannot
-rewrite a structurally invalid graph.
+Ordinary reads validate these invariants before commands operate on the tree,
+and every tree write validates them before atomic replacement. `clear-active`
+may skip only active-pointer validation on read, then sets that pointer to null
+and performs full validation before writing; it cannot repair an invalid graph.
+Destructive `clear` and `reset` instead skip parsing the existing tree and
+replace it with a validated empty tree, or remove it with `--drop-file`.
+All these operations still apply the directory-selection and multiple-JSON
+checks above. Artifact cleanup follows the
+[destructive-operation contract](destructive-operations.md).
 
 Tree writes flush the temporary JSON, atomically replace the selected file,
 and synchronize its parent directory while holding the store lock. Removing

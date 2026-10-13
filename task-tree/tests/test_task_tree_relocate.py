@@ -67,8 +67,11 @@ def test_cross_parent_before_anchor_returns_complete_receipt_and_shared_timestam
         final_previous_id=5,
         final_next_id=6,
         moved_at=receipt.moved_at,
+        move_marker=receipt.move_marker,
     )
     assert node(data, 2)["events"]["moved_at"] == receipt.moved_at
+    assert node(data, 2)["events"]["move_marker"] == receipt.move_marker
+    assert receipt.move_marker
     assert node(data, 1)["closeout_reviewed"] is False
     assert node(data, 4)["closeout_reviewed"] is False
     assert node(data, 1)["events"]["closeout_reviewed_updated_at"] == receipt.moved_at

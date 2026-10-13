@@ -21,7 +21,8 @@ def copy_fixture(tmp_path: Path) -> Path:
 
 
 def write_spec(tmp_path: Path, payload) -> Path:
-    spec = tmp_path / "partition.json"
+    spec = tmp_path / "inputs" / "partition.json"
+    spec.parent.mkdir()
     spec.write_text(json.dumps(payload), encoding="utf-8")
     return spec
 
@@ -30,7 +31,7 @@ def run_tree(tree: Path, *args: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.pop("TASK_TREE_FILE", None)
     return subprocess.run(
-        [sys.executable, str(TASK_TREE), "--tree-file", str(tree), *args],
+        [sys.executable, str(TASK_TREE), "--tree-dir", str(tree.parent), *args],
         text=True,
         capture_output=True,
         check=False,

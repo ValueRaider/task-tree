@@ -11,6 +11,7 @@ import stat
 import sys
 import tempfile
 import textwrap
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -82,9 +83,42 @@ class ExclusiveTreeTransaction:
 class TaskTreeStore:
     path: str
 
+    def __post_init__(self) -> None:
+        # The filename is not a selector: every store instance owns the same
+        # canonical namespace within its selected directory.
+        self.path = os.path.join(os.path.dirname(self.path) or ".", "tree.json")
+
     @property
     def lock_path(self) -> str:
         return f"{self.path}.lock"
+
+    def _canonicalize_directory_unlocked(self) -> bool:
+        """Validate and, when needed, canonicalize the sole top-level JSON.
+
+        The caller must hold the selected directory's canonical lock exclusively.
+        Returns whether a noncanonical filename was renamed.
+        """
+        directory = os.path.dirname(self.path) or "."
+        canonical = os.path.join(directory, "tree.json")
+        candidates = []
+        try:
+            with os.scandir(directory) as entries:
+                candidates = [entry.path for entry in entries
+                              if entry.name.endswith(".json") and entry.is_file()]
+        except FileNotFoundError:
+            candidates = []
+        candidates.sort()
+        if len(candidates) > 1:
+            raise ValueError("multiple JSON files in selected tree directory: " + ", ".join(candidates))
+        if not candidates or os.path.abspath(candidates[0]) == os.path.abspath(canonical):
+            return False
+
+        old_path = candidates[0]
+        notepad_storage.preserve_legacy_note(old_path, canonical)
+        os.rename(old_path, canonical)
+        self._fsync_directory_unlocked(directory)
+        print(f"warning: canonicalized tree store {old_path} to {canonical}", file=sys.stderr)
+        return True
 
     def _empty_data(self) -> Dict:
         return {
@@ -172,6 +206,7 @@ class TaskTreeStore:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             transaction: Optional[ExclusiveTreeTransaction] = None
             try:
+                self._canonicalize_directory_unlocked()
                 if read_tree:
                     data, _ = self._read_unlocked(validate_active=validate_active)
                 else:
@@ -194,11 +229,15 @@ class TaskTreeStore:
                 transaction.commit()
             return
 
-        lock_mode = fcntl.LOCK_EX if write else fcntl.LOCK_SH
         lock_dir = os.path.dirname(self.lock_path) or "."
         os.makedirs(lock_dir, exist_ok=True)
         with open(self.lock_path, "a+", encoding="utf-8") as lock_file:
-            fcntl.flock(lock_file.fileno(), lock_mode)
+            # Selection and a possible filename/note migration are protected by
+            # the canonical exclusive lock. Ordinary reads then share it.
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self._canonicalize_directory_unlocked()
+            if not write:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
             data, initialized_version = self._read_unlocked(
                 validate_active=validate_active
             )
@@ -239,6 +278,7 @@ class RelocationReceipt:
     final_previous_id: Optional[int]
     final_next_id: Optional[int]
     moved_at: str
+    move_marker: str
 
     @property
     def source_task_id(self) -> int:
@@ -249,35 +289,43 @@ class RelocationReceipt:
         return self.destination_parent_id
 
 
-def store_path_selection(cli_tree_file: Optional[str] = None) -> tuple[str, Optional[str]]:
-    """Return the selected path and the deprecated environment variable, if used."""
+def store_path_selection(
+    cli_tree_file: Optional[str] = None, cli_tree_dir: Optional[str] = None
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Return selected directory, legacy selector, and its concrete path."""
+    if cli_tree_dir:
+        return cli_tree_dir, None, None
     if cli_tree_file:
-        return cli_tree_file, None
+        return os.path.dirname(cli_tree_file) or ".", "--tree-file", cli_tree_file
 
     explicit = os.environ.get("TASK_TREE_FILE")
     if explicit:
-        return explicit, "TASK_TREE_FILE"
+        return os.path.dirname(explicit) or ".", "TASK_TREE_FILE", explicit
 
     agent_name = os.environ.get("TASK_TREE_AGENT", "").strip()
     if agent_name:
         safe_name = slugify_agent_name(agent_name)
-        return f"./task_tree/{safe_name}.json", "TASK_TREE_AGENT"
+        old_path = f"./task_tree/{safe_name}.json"
+        return os.path.dirname(old_path), "TASK_TREE_AGENT", old_path
 
-    return "./task_tree/tree.json", None
-
-
-def default_store(cli_tree_file: Optional[str] = None) -> TaskTreeStore:
-    path, _ = store_path_selection(cli_tree_file)
-    return TaskTreeStore(path)
+    return "./task_tree", None, None
 
 
-def deprecated_store_environment_warning(cli_tree_file: Optional[str] = None) -> Optional[str]:
-    path, environment_variable = store_path_selection(cli_tree_file)
-    if environment_variable is None:
+def default_store(
+    cli_tree_file: Optional[str] = None, cli_tree_dir: Optional[str] = None
+) -> TaskTreeStore:
+    directory, _, _ = store_path_selection(cli_tree_file, cli_tree_dir)
+    return TaskTreeStore(os.path.join(directory, "tree.json"))
+
+
+def deprecated_store_environment_warning(
+    cli_tree_file: Optional[str] = None, cli_tree_dir: Optional[str] = None
+) -> Optional[str]:
+    directory, selector, _ = store_path_selection(cli_tree_file, cli_tree_dir)
+    if selector is None:
         return None
     return (
-        f"warning: {environment_variable} is deprecated; replace it with "
-        f"--tree-file {shlex.quote(path)}"
+        f"warning: {selector} is deprecated; use --tree-dir {shlex.quote(directory)}"
     )
 
 
@@ -764,8 +812,11 @@ def task_artifact_files(files_dir: str) -> List[str]:
     return artifacts
 
 
-def event_log_path_for_node(store: TaskTreeStore, node: Dict) -> str:
-    files_dir = node.get("files_dir") or task_files_dir_for_store(store, node["id"])
+def event_log_path_for_node(store: TaskTreeStore, node: Dict) -> Optional[str]:
+    """Return an event-log path only for a task with an attached directory."""
+    files_dir = node.get("files_dir")
+    if not files_dir:
+        return None
     return os.path.join(files_dir, "events.jsonl")
 
 
@@ -905,22 +956,9 @@ def relocate_node(
     destination_owner.insert(final_index, source_id)
 
     moved_at = utc_now()
-    # ``utc_now`` intentionally has second precision for compact event logs.
-    # A rapid inverse relocation must nevertheless have a distinct marker so
-    # a retained undo receipt can detect that the task changed again.
-    previous_moved_at = source.get("events", {}).get("moved_at")
-    if previous_moved_at == moved_at:
-        try:
-            moved_at = (
-                datetime.fromisoformat(moved_at.replace("Z", "+00:00"))
-                + timedelta(seconds=1)
-            ).isoformat().replace("+00:00", "Z")
-        except ValueError:
-            # The schema accepts arbitrary event strings; if an old malformed
-            # value happens to equal the current timestamp, retaining the
-            # current valid timestamp is preferable to failing relocation.
-            pass
+    move_marker = uuid.uuid4().hex
     stamp_event(source, "moved_at", moved_at)
+    ensure_node_events(source)["move_marker"] = move_marker
     for parent_id in {original_parent_id, destination_parent_id}:
         if parent_id is None:
             continue
@@ -946,6 +984,7 @@ def relocate_node(
         final_previous_id=final_previous_id,
         final_next_id=final_next_id,
         moved_at=moved_at,
+        move_marker=move_marker,
     )
 
 
@@ -1047,11 +1086,17 @@ def render_node_details(
                 noun = "file" if omitted == 1 else "files"
                 lines.append(f"  ... {omitted} more {noun}")
     event_log_path = event_log_path_for_node(store, node)
-    if os.path.exists(event_log_path):
-        lines.append(f"event_log: {event_log_path}")
-        latest_event = latest_event_record(event_log_path)
-        if latest_event is not None:
-            lines.append(f"latest_event: {summarize_event_record(latest_event)}")
+    if event_log_path:
+        try:
+            latest_event = latest_event_record(event_log_path)
+        except (OSError, ValueError) as error:
+            lines.append(f"event_log: {event_log_path}")
+            lines.append(f"event log warning: {error}")
+        else:
+            if latest_event is not None or os.path.exists(event_log_path):
+                lines.append(f"event_log: {event_log_path}")
+            if latest_event is not None:
+                lines.append(f"latest_event: {summarize_event_record(latest_event)}")
     events = ensure_node_events(node)
     if events:
         lines.append("events:")
@@ -1548,7 +1593,13 @@ def load_partition_steps(path: str) -> List[Dict[str, str]]:
     return validated_steps
 
 
-def ensure_task_files_dir(store: TaskTreeStore, node: Dict, timestamp: Optional[str] = None) -> str:
+def ensure_task_files_dir(
+    store: TaskTreeStore,
+    node: Dict,
+    timestamp: Optional[str] = None,
+    *,
+    attach_existing: bool = False,
+) -> str:
     files_dir = node.get("files_dir")
     canonical_path = task_files_dir_for_store(store, node["id"])
     if files_dir and not is_canonical_task_files_path(store, node["id"], files_dir):
@@ -1579,13 +1630,22 @@ def ensure_task_files_dir(store: TaskTreeStore, node: Dict, timestamp: Optional[
             os.mkdir(canonical_path)
         return files_dir
 
-    try:
+    if os.path.lexists(canonical_path):
+        path_status = os.lstat(canonical_path)
+        if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISDIR(path_status.st_mode):
+            raise ValueError(
+                f"artifact path collision for task {node['id']}: {canonical_path!r} "
+                "exists but is not a canonical directory"
+            )
+        if not attach_existing:
+            raise ValueError(
+                f"artifact path collision for task {node['id']}: {canonical_path!r} "
+                "already exists; inspect and preserve its contents, then move it to "
+                "an operator-selected location before creating a new directory, or "
+                "use --attach-existing only after confirming it belongs to this task"
+            )
+    else:
         os.mkdir(canonical_path)
-    except FileExistsError as exc:
-        raise ValueError(
-            f"artifact path collision for task {node['id']}: {canonical_path!r} "
-            "already exists; inspect it or run scan-files --prune before attaching files"
-        ) from exc
     node["files_dir"] = canonical_path
     stamp_event(node, "files_created_at", timestamp)
     return canonical_path
@@ -1622,14 +1682,19 @@ def append_event_record(path: str, record: Dict) -> None:
 
 
 def load_event_records(path: str) -> List[Dict]:
-    if not os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                lines = f.readlines()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except FileNotFoundError:
         return []
-    with open(path, "r", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-        try:
-            lines = f.readlines()
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except UnicodeError as exc:
+        raise ValueError(f"invalid event log UTF-8 in {path}: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"unable to read event log {path}: {exc}") from exc
     records: List[Dict] = []
     for line_no, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
@@ -1668,8 +1733,8 @@ def render_event_record_text(record: Dict) -> List[str]:
     return lines
 
 
-def render_event_log_text(path: str, records: List[Dict]) -> str:
-    lines = [f"event_log: {path}"]
+def render_event_log_text(path: Optional[str], records: List[Dict]) -> str:
+    lines = [f"event_log: {path if path is not None else '(not attached)'}"]
     if not records:
         lines.append("(no events logged)")
         return "\n".join(lines)
@@ -1679,7 +1744,7 @@ def render_event_log_text(path: str, records: List[Dict]) -> str:
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_data() as data:
         if getattr(args, "json", False):
             print(json.dumps(status_snapshot_to_dict(store, data), indent=2, ensure_ascii=False))
@@ -1704,13 +1769,13 @@ def cmd_tui(args: argparse.Namespace) -> int:
         raise
     # Pass the already-loaded data-layer callable into the optional UI.  The
     # TUI must not import this module again under a second identity.
-    return run_tui(default_store(args.tree_file), relocate_node=relocate_node)
+    return run_tui(default_store(args.tree_file, args.tree_dir), relocate_node=relocate_node)
 
 
 def cmd_show(args: argparse.Namespace) -> int:
     if args.details and args.node_id is None:
         raise ValueError("show --details requires ID")
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_data() as data:
         if args.node_id is None:
             if args.json:
@@ -1734,7 +1799,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_transaction() as transaction:
         data = transaction.data
         if args.parent is not None:
@@ -1781,7 +1846,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 def cmd_partition(args: argparse.Namespace) -> int:
     steps = load_partition_steps(args.from_file)
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_transaction() as transaction:
         data = transaction.data
         parent = require_node(data, args.parent_id)
@@ -1849,7 +1914,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     elif args.body is not None:
         body = args.body
 
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_transaction() as transaction:
         data = transaction.data
         node = require_node(data, args.node_id)
@@ -1889,7 +1954,7 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 
 def cmd_active(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_data() as data:
         active_id = data["active_id"]
         if active_id is None:
@@ -1904,7 +1969,7 @@ def cmd_active(args: argparse.Namespace) -> int:
 
 
 def cmd_set_active(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_transaction() as transaction:
         data = transaction.data
         node = require_node(data, args.node_id)
@@ -1916,7 +1981,7 @@ def cmd_set_active(args: argparse.Namespace) -> int:
 
 
 def cmd_clear_active(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_transaction(validate_active=False) as transaction:
         data = transaction.data
         data["active_id"] = None
@@ -1927,7 +1992,7 @@ def cmd_clear_active(args: argparse.Namespace) -> int:
 
 
 def cmd_path(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_data() as data:
         for node in node_path(data, args.node_id):
             print(f"#{node['id']} {node['summary']} [{node['status']}]")
@@ -1935,7 +2000,7 @@ def cmd_path(args: argparse.Namespace) -> int:
 
 
 def cmd_move(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_transaction() as transaction:
         data = transaction.data
         relocate_node(data, args.node_id, args.parent)
@@ -1946,7 +2011,7 @@ def cmd_move(args: argparse.Namespace) -> int:
 
 
 def cmd_reorder(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_transaction() as transaction:
         data = transaction.data
         node = require_node(data, args.node_id)
@@ -1984,7 +2049,7 @@ def cmd_reorder(args: argparse.Namespace) -> int:
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     cleanup = empty_cleanup_result()
     cleanup_plan: List[Dict] = []
     with store.locked_transaction() as transaction:
@@ -2049,10 +2114,10 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_data() as data:
         nodes = list_candidates(data, args.status)
-        if not nodes:
+        if not nodes and not args.json:
             print("(no matching tasks)")
             return 0
         if args.json:
@@ -2068,11 +2133,11 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_children(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_data() as data:
         require_node(data, args.node_id)
         nodes = child_nodes(data, args.node_id)
-        if not nodes:
+        if not nodes and not args.json:
             print("(no child tasks)")
             return 0
         if args.json:
@@ -2113,7 +2178,7 @@ def cmd_children(args: argparse.Namespace) -> int:
 
 
 def cmd_query(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_data() as data:
         nodes = query_candidates(
             data,
@@ -2122,7 +2187,7 @@ def cmd_query(args: argparse.Namespace) -> int:
             event_name=args.event,
             since_days=args.since_days,
         )
-        if not nodes:
+        if not nodes and not args.json:
             print("(no matching tasks)")
             return 0
         if args.json:
@@ -2160,7 +2225,7 @@ def cmd_next(args: argparse.Namespace) -> int:
     When a completed child leaves its parent with no pending direct children,
     next returns the parent for closeout before advancing outside that branch.
     """
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_data() as data:
         if args.node_id is not None:
             require_node(data, args.node_id)
@@ -2173,18 +2238,18 @@ def cmd_next(args: argparse.Namespace) -> int:
 
 
 def cmd_ensure_files(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_transaction() as transaction:
         data = transaction.data
         node = require_node(data, args.node_id)
-        output = ensure_task_files_dir(store, node)
+        output = ensure_task_files_dir(store, node, attach_existing=args.attach_existing)
         transaction.commit()
     print(output)
     return 0
 
 
 def cmd_log_event(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     record = build_event_record(args, args.event)
     with store.locked_transaction() as transaction:
         data = transaction.data
@@ -2198,11 +2263,11 @@ def cmd_log_event(args: argparse.Namespace) -> int:
 
 
 def cmd_event_log(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     with store.locked_data() as data:
         node = require_node(data, args.node_id)
         log_path = event_log_path_for_node(store, node)
-        records = load_event_records(log_path)
+        records = load_event_records(log_path) if log_path is not None else []
         if args.tail is not None:
             records = records[-args.tail :] if args.tail else []
         if args.json:
@@ -2226,7 +2291,7 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
             print(f"task_tree.py checkpoint: could not read --body-file {args.body_file!r}: {exc}", file=sys.stderr)
             return 1
 
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     record = build_event_record(args, "checkpoint")
     with store.locked_transaction() as transaction:
         data = transaction.data
@@ -2243,7 +2308,7 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
 
 
 def cmd_prune_files(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     cleanup = empty_cleanup_result()
     cleanup_plan: List[Dict] = []
     with store.locked_transaction() as transaction:
@@ -2280,7 +2345,7 @@ def cmd_prune_files(args: argparse.Namespace) -> int:
 
 
 def cmd_scan_files(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     if args.prune:
         with store.locked_transaction() as transaction:
             inventory = scan_managed_artifacts(store, transaction.data)
@@ -2296,7 +2361,7 @@ def cmd_scan_files(args: argparse.Namespace) -> int:
 
 
 def cmd_notepad(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     # Note replacement does not commit task metadata. The existing exclusive
     # lock serializes it with both other note writers and shared cleanup.
     if args.notepad_action == "show":
@@ -2331,13 +2396,14 @@ def cmd_notepad(args: argparse.Namespace) -> int:
 
 
 def cmd_shared_dir(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
-    print(ensure_dir(shared_dir_for_store(store)))
+    store = default_store(args.tree_file, args.tree_dir)
+    with store.locked_data() as _data:
+        print(ensure_dir(shared_dir_for_store(store)))
     return 0
 
 
 def cmd_clear(args: argparse.Namespace) -> int:
-    store = default_store(args.tree_file)
+    store = default_store(args.tree_file, args.tree_dir)
     cleanup = empty_cleanup_result()
     tree_file_removed = False
     with store.locked_transaction(read_tree=False) as transaction:
@@ -2449,16 +2515,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Persistent task tree. If no command is specified, show the "
-            "compact active-task snapshot."
+            "compact active-task snapshot. Default store: ./task_tree/tree.json."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--tree-dir",
+        metavar="PATH",
+        help="Use PATH as the task-tree store directory. Default: ./task_tree",
+    )
+    selection.add_argument(
         "--tree-file",
         metavar="PATH",
         help=(
-            "Use PATH as the task-tree JSON file for this invocation. "
-            "Default: ./task_tree/tree.json"
+            "Deprecated: select PATH's parent directory as the store; use --tree-dir."
         ),
     )
     sub = parser.add_subparsers(dest="command")
@@ -2743,11 +2814,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create and print the task-specific artifact directory",
         description=(
             "Create or reuse the task's attached canonical artifact directory. "
-            "If files_dir is null, refuse to adopt a pre-existing path; inspect "
-            "the collision or prune a confirmed orphan with scan-files --prune."
+            "If files_dir is null, refuse to adopt a pre-existing path by default. "
+            "After confirming the existing directory belongs to this task, "
+            "--attach-existing explicitly attaches it without changing contents. "
+            "If association is unknown, preserve the folder by moving it to an "
+            "operator-selected location before creating a new task directory."
         ),
     )
     ensure_files.add_argument("node_id", type=int, metavar="ID", help="Identify the task whose artifact directory to create.")
+    ensure_files.add_argument(
+        "--attach-existing",
+        action="store_true",
+        help="Attach an existing canonical directory after confirming it belongs to this task.",
+    )
     ensure_files.set_defaults(func=cmd_ensure_files)
 
     log_event = add_command(
@@ -2857,7 +2936,7 @@ def main(argv: List[str]) -> int:
     parser = build_parser()
     parser.set_defaults(func=cmd_snapshot)
     args = parser.parse_args(argv)
-    warning = deprecated_store_environment_warning(args.tree_file)
+    warning = deprecated_store_environment_warning(args.tree_file, args.tree_dir)
     if warning:
         print(warning, file=sys.stderr)
     if args.command == "active":
